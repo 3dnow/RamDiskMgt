@@ -50,6 +50,18 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: target.path + "/" + AEAEngine.manifestName))
     }
 
+    @Test func sameSecondBackupsGetDistinctFileNames() throws {
+        let dir = TempDir("names")
+        let first = BackupService.uniqueDestination(in: dir.url, fileName: "Cache-20261104-120000.aea")
+        #expect(first.hasSuffix("/Cache-20261104-120000.aea"))
+        try Data().write(to: URL(fileURLWithPath: first))
+        let second = BackupService.uniqueDestination(in: dir.url, fileName: "Cache-20261104-120000.aea")
+        #expect(second.hasSuffix("/Cache-20261104-120000-2.aea"))
+        try Data().write(to: URL(fileURLWithPath: second))
+        let third = BackupService.uniqueDestination(in: dir.url, fileName: "Cache-20261104-120000.aea")
+        #expect(third.hasSuffix("/Cache-20261104-120000-3.aea"))
+    }
+
     @Test(arguments: BackupFormat.allCases)
     func partialBackupAndPartialRestore(format: BackupFormat) async throws {
         let volume = makeVolume()

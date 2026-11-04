@@ -377,17 +377,25 @@ final class AppModel {
                 throw RamDiskError.operationFailed("“\(disk.name)”上正在进行：\(running)。请等它完成后再推出，强行推出会让它失败，盘上内容也会丢失。")
             }
             op.phase = "推出"
-            if !force, let profile = self.profile(for: disk), profile.autosave.enabled, profile.autosave.onQuit,
-               let pw = KeychainStore.load(account: profile.keychainAccount) {
-                op.phase = "推出前自动备份"
-                do {
-                    _ = try await self.performBackup(disk: disk, profile: profile, scope: .full, format: profile.autosave.format,
-                                                     password: pw, destination: profile.backupDirectoryURL, automatic: true, op: op)
-                } catch {
+            if !force, let profile = self.profile(for: disk), profile.autosave.enabled, profile.autosave.onQuit {
+                if let pw = KeychainStore.load(account: profile.keychainAccount) {
+                    op.phase = "推出前自动备份"
+                    do {
+                        _ = try await self.performBackup(disk: disk, profile: profile, scope: .full, format: profile.autosave.format,
+                                                         password: pw, destination: profile.backupDirectoryURL, automatic: true, op: op)
+                    } catch {
+                        let proceed = await self.askAboutHolders(
+                            title: "推出前的自动备份失败",
+                            message: "\(error.localizedDescription)\n\n继续推出的话，盘上的内容不会被备份，推出后就没了。", holders: [],
+                            continueLabel: "仍然推出")
+                        guard proceed else { throw CancellationError() }
+                    }
+                } else {
+                    // 用户设置了“推出时备份”，却没保存密码：原来这里直接跳过备份，用户以为有备份其实没有。
                     let proceed = await self.askAboutHolders(
-                        title: "推出前的自动备份失败",
-                        message: "\(error.localizedDescription)\n\n继续推出的话，盘上的内容不会被备份，推出后就没了。", holders: [],
-                        continueLabel: "仍然推出")
+                        title: "无法在推出前自动备份",
+                        message: "“\(disk.name)”设置了“推出 / 退出时备份”，但钥匙串里没有保存备份密码，这次不会备份。继续推出的话，盘上的内容就没了。\n\n可以先取消，到“概览 → 自动化”保存密码，或者手动备份一次。",
+                        holders: [], continueLabel: "仍然推出")
                     guard proceed else { throw CancellationError() }
                 }
             }
@@ -445,6 +453,17 @@ final class AppModel {
         }
     }
 
+    /// 只写回自动化相关的字段。“自动化”编辑器拿着的是一份副本，期间别的操作（例如扩容）可能已经改了容量，
+    /// 整份覆盖会把这些改动冲掉。
+    func saveAutomation(from edited: DiskProfile) {
+        var latest = profile(id: edited.id) ?? edited
+        latest.autoCreate = edited.autoCreate
+        latest.restoreLatestOnCreate = edited.restoreLatestOnCreate
+        latest.autosave = edited.autosave
+        latest.backupDirectory = edited.backupDirectory
+        saveProfile(latest)
+    }
+
     func deleteProfile(_ profile: DiskProfile) {
         Task {
             try? await profileStore.remove(id: profile.id)
@@ -458,7 +477,9 @@ final class AppModel {
     /// 把一块外部创建的 RAM 盘纳入管理（保存配置）。
     func adopt(_ disk: RamDisk) {
         let custom = disk.mountPoint == "/Volumes/\(disk.name)" ? nil : disk.mountPoint
-        let profile = DiskProfile(name: disk.name, backend: disk.backend, sizeBytes: disk.capacityBytes,
+        // ram:// 盘的卷容量比设备小（APFS 容器开销），按设备大小记，重建时才能得到同样大的盘。
+        let size = disk.backend.isRamDevice && disk.deviceBytes > 0 ? disk.deviceBytes : disk.capacityBytes
+        let profile = DiskProfile(name: disk.name, backend: disk.backend, sizeBytes: size,
                                   customMountPoint: custom, options: disk.options)
         saveProfile(profile)
     }

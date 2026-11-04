@@ -120,6 +120,20 @@ import Testing
         #expect(report.deletedCount == 0)
         #expect(FileManager.default.fileExists(atPath: outside.path + "/victim.txt"))
     }
+
+    /// 卷外目录的路径恰好以卷路径开头（/Volumes/Cache 与 /Volumes/Cache2）：只比字符串前缀会放行。
+    @Test func cleanupRefusesSiblingWithSamePrefix() async throws {
+        let root = TempDir("root")
+        let sibling = root.path + "2"
+        try FileManager.default.createDirectory(atPath: sibling, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: sibling) }
+        try Data("must survive".utf8).write(to: URL(fileURLWithPath: sibling + "/victim.txt"))
+        root.symlink("evil", to: sibling)
+        let report = await CleanupService.delete(relativePaths: ["evil/victim.txt"], root: root.path)
+        #expect(report.deletedCount == 0)
+        #expect(report.failures.count == 1)
+        #expect(FileManager.default.fileExists(atPath: sibling + "/victim.txt"))
+    }
 }
 
 @Suite struct CloneAwarenessTests {

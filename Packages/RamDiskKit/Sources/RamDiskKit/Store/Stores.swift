@@ -29,7 +29,17 @@ struct JSONFile<Value: Codable & Sendable>: Sendable {
         guard let data = try? Data(contentsOf: url) else { return value }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode(Value.self, from: data)) ?? value
+        do {
+            return try decoder.decode(Value.self, from: data)
+        } catch {
+            // 文件损坏，或是更新版本写的格式：不能悄悄按空列表处理——下一次保存就会把原文件覆盖掉，
+            // 所有盘配置 / 备份清单就此丢失。改名留档并记日志，让用户有机会找回。
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let aside = url.deletingPathExtension().appendingPathExtension("corrupt-\(stamp).json")
+            try? FileManager.default.moveItem(at: url, to: aside)
+            DiagnosticsLog.append("store", "无法读取 \(url.lastPathComponent)：\(error)\n原文件已改名为 \(aside.lastPathComponent)，本次按空列表启动。")
+            return value
+        }
     }
 
     func save(_ value: Value) throws {

@@ -289,13 +289,14 @@ public enum FileSync {
     static func copyItem(from: String, to: String) throws {
         let flags = copyfile_flags_t(COPYFILE_ALL | COPYFILE_NOFOLLOW | COPYFILE_UNLINK)
         if copyfile(from, to, nil, flags) != 0 {
-            let code = errno
+            var code = errno
             if code == ENOENT {
                 // 父目录可能尚未创建（选择性同步时）。
                 try FileManager.default.createDirectory(atPath: (to as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
                 if copyfile(from, to, nil, flags) == 0 { return }
+                code = errno
             }
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
         }
     }
 

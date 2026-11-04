@@ -64,10 +64,10 @@ build/rdmctl analyze /Volumes/Cache --top 20
 ```
 
 ```bash
-build/rdmctl clean /Volumes/Cache --min-size 200M --dry-run
+build/rdmctl clean /Volumes/Cache --min-size 200M
 ```
 
-`rdmctl` 不带参数会显示全部命令。密码只从环境变量 `RDM_PASSWORD` 或交互输入读取，不走命令行参数。
+`rdmctl` 不带参数会显示全部命令。密码只从环境变量 `RDM_PASSWORD` 或交互输入读取，不走命令行参数。`clean` 默认只列出候选文件，加 `--yes` 才真正删除。
 
 ## 数据位置
 
@@ -103,7 +103,7 @@ RDM_SUPPORT_DIR=/tmp/rdm-shots build/RamDiskMgt.app/Contents/MacOS/RamDiskMgt --
 - 第三条：GUI 层端到端自检；把 `apfs` 换成 `tmpfs` 会弹管理员密码框。
 - 第四条：把主要界面渲染成 PNG。
 
-设计与实测结论见 [docs/设计文档.md](docs/设计文档.md)，测试记录见 [docs/测试报告.md](docs/测试报告.md)。
+设计与实测结论见 [docs/设计文档.md](docs/设计文档.md)，测试记录见 [docs/测试报告.md](docs/测试报告.md)，代码审查结论见 [docs/代码审查-2026-11.md](docs/代码审查-2026-11.md)。
 
 ## 目录结构
 

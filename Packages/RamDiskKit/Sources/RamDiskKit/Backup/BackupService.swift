@@ -51,7 +51,7 @@ public actor BackupService {
             throw BackupError.failed("部分备份至少要选择一项")
         }
         let directory = try AppPaths.ensure(request.destinationDirectory)
-        let destination = directory.appendingPathComponent(Self.fileName(for: request)).path
+        let destination = Self.uniqueDestination(in: directory, fileName: Self.fileName(for: request))
         let selection = request.scope.selection.map(PathSelection.init)
 
         let payload: UInt64
@@ -119,6 +119,20 @@ public actor BackupService {
         if case .partial = request.scope { name += "-partial" }
         if request.isAutomatic { name += "-auto" }
         return name + "." + request.format.fileExtension
+    }
+
+    /// 文件名精确到秒：同一秒内的两次备份（例如手动备份撞上定时备份）会算出同一个名字。
+    /// 已存在时加序号，否则后一份会覆盖前一份，且两条记录指向同一个文件，删除其中一条会把另一条的文件也移走。
+    static func uniqueDestination(in directory: URL, fileName: String) -> String {
+        let base = (fileName as NSString).deletingPathExtension
+        let ext = (fileName as NSString).pathExtension
+        var candidate = directory.appendingPathComponent(fileName).path
+        var index = 2
+        while FileManager.default.fileExists(atPath: candidate) {
+            candidate = directory.appendingPathComponent("\(base)-\(index).\(ext)").path
+            index += 1
+        }
+        return candidate
     }
 
     // MARK: - 查看 / 校验

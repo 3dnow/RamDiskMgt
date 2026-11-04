@@ -103,6 +103,9 @@ public actor ResizeService {
         }
 
         var oldUnmounted = false
+        /// 新盘已挂到原路径并通过校验。之后再出错（释放旧设备失败、重新查询失败）不能回滚：
+        /// 回滚会把已经在用的新盘拆掉、换回旧数据，切换之后写入的内容就丢了。
+        var verified = false
         do {
             let copied = try await syncTwoPhase(from: disk.mountPoint, to: target.mountPoint, options: options, progress: progress)
             let expected = try FileSync.summary(of: URL(fileURLWithPath: disk.mountPoint))
@@ -121,16 +124,30 @@ public actor ResizeService {
             guard actual == expected else {
                 throw RamDiskError.operationFailed("校验不一致：原盘 \(expected.files) 个文件 / \(ByteSize.format(expected.bytes))，新盘 \(actual.files) 个文件 / \(ByteSize.format(actual.bytes))")
             }
+            verified = true
 
             progress?(ResizeProgress(phase: .cleaningUp, message: "释放旧盘内存"))
-            try await manager.ejectRamDevice(oldWhole, volumeDevice: nil, force: true)
+            do {
+                try await manager.ejectRamDevice(oldWhole, volumeDevice: nil, force: true)
+            } catch {
+                // 旧设备没释放只是多占内存，新盘已经可用，不算失败。
+                DiagnosticsLog.append("resize", "新盘已切换到 \(disk.mountPoint)，但释放旧设备 \(oldWhole) 失败：\(error.localizedDescription)。可手动执行 diskutil eject \(oldWhole)。")
+            }
             try? FileManager.default.removeItem(atPath: staging)
-            guard let result = try await manager.disk(at: disk.mountPoint) else {
-                throw RamDiskError.operationFailed("切换后找不到新盘")
+            let result: RamDisk
+            if let found = try? await manager.disk(at: disk.mountPoint) {
+                result = found
+            } else {
+                // 重新枚举失败时按已知信息拼出结果，再用挂载表刷新容量。
+                result = RamDisk(name: disk.name, backend: disk.backend, mountPoint: disk.mountPoint, wholeDevice: newWhole,
+                                 volumeDevice: newVolume, deviceBytes: target.deviceBytes, capacityBytes: target.capacityBytes,
+                                 usedBytes: target.usedBytes, availableBytes: target.availableBytes,
+                                 hidden: disk.hidden, noExec: disk.noExec).refreshed()
             }
             progress?(ResizeProgress(phase: .done, message: "完成"))
             return ResizeResult(disk: result, copiedBytes: copied, switchDuration: switchDuration)
         } catch {
+            if verified { throw error }
             // 回滚：卸掉新盘，把旧盘挂回原处。
             _ = try? await Shell.run("/usr/sbin/diskutil", ["unmount", "force", newVolume])
             if oldUnmounted {
@@ -159,9 +176,10 @@ public actor ResizeService {
         let optArg = mountOpts.isEmpty ? "" : " -o " + mountOpts.joined(separator: ",")
 
         progress?(ResizeProgress(phase: .creatingTarget, message: "创建暂存盘（ram:// APFS）"))
-        let stagingSize = max(disk.usedBytes + RamDiskBackend.apfs.overheadBytes * 2, RamDiskBackend.apfs.minimumSize)
+        // tmpfs 按页统计用量，小文件搬到 APFS 上还有每个文件的元数据开销，暂存盘按还原时的推荐容量留余量。
+        let stagingSize = RestoreSizing.recommendedDiskSize(forContent: disk.usedBytes, backend: .apfs)
         let stagingDisk = try await manager.createRamDevice(
-            DiskSpec(name: "RDMStaging", backend: .apfs, sizeBytes: ByteSize.align(stagingSize, to: ByteSize.mib)),
+            DiskSpec(name: "RDMStaging", backend: .apfs, sizeBytes: stagingSize),
             mountAt: staging, options: MountOptions(hidden: true))
         guard let stagingWhole = stagingDisk.wholeDevice else { throw RamDiskError.operationFailed("暂存盘缺少设备信息") }
 
@@ -203,13 +221,25 @@ public actor ResizeService {
             return ResizeResult(disk: result, copiedBytes: report.copiedBytes, switchDuration: switchDuration)
         } catch {
             if !originalGone {
-                // 原盘还在：直接丢弃暂存盘即可。
-                try? await manager.ejectRamDevice(stagingWhole, volumeDevice: stagingDisk.volumeDevice, force: true)
-                try? FileManager.default.removeItem(atPath: staging)
+                if Self.isTmpfsMounted(at: mp) {
+                    // 原盘还在（同步出错、用户取消切换或取消授权）：直接丢弃暂存盘即可。
+                    try? await manager.ejectRamDevice(stagingWhole, volumeDevice: stagingDisk.volumeDevice, force: true)
+                    try? FileManager.default.removeItem(atPath: staging)
+                    throw error
+                }
+                // 提权脚本在 umount 之后才失败（例如 mount_tmpfs 出错）：原盘已经没了，暂存盘是唯一的数据副本，绝不能丢。
+                DiagnosticsLog.append("resize", "tmpfs 切换失败且原盘 \(mp) 已卸载，数据保留在暂存盘 \(stagingDisk.mountPoint)（设备 \(stagingWhole)）：\(error.localizedDescription)")
+                throw RamDiskError.operationFailed("\(error.localizedDescription)\n原盘已被卸载，数据完整保留在暂存盘 \(stagingDisk.mountPoint)。请先把需要的内容拷走，再用 diskutil eject \(stagingWhole) 释放它。")
             }
             // 原盘已卸载时保留暂存盘，数据不丢，错误信息里带有暂存路径。
             throw error
         }
+    }
+
+    /// `path` 现在是否仍是一个 tmpfs 挂载点的根。
+    static func isTmpfsMounted(at path: String) -> Bool {
+        guard let entry = MountTable.entry(at: path) else { return false }
+        return entry.fsType == "tmpfs" && MountTable.normalize(entry.mountPoint) == MountTable.normalize(path)
     }
 
     // MARK: - 两轮同步

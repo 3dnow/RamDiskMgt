@@ -244,6 +244,10 @@ struct ProfileAutomationEditor: View {
                     }
                     .scaledFrame(width: 140)
                 }
+                if !hasPassword {
+                    Label("还没有保存密码：定时备份和推出 / 退出时的备份都不会执行。", systemImage: "exclamationmark.triangle.fill")
+                        .appFont(.callout).foregroundStyle(Theme.warning)
+                }
                 HStack {
                     if hasPassword {
                         Label("备份密码已保存在钥匙串", systemImage: "key.fill").foregroundStyle(.secondary)
@@ -265,10 +269,28 @@ struct ProfileAutomationEditor: View {
                     }
                 }
                 .appFont(.callout)
-                Text("备份保存到：\(profile.backupDirectoryURL.path)").appFont(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Text("备份保存到：\(profile.backupDirectoryURL.path)")
+                        .appFont(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Button("更改…") { chooseBackupDirectory() }.controlSize(.small)
+                    if profile.backupDirectory != nil {
+                        Button("恢复默认") { profile.backupDirectory = nil }.controlSize(.small)
+                    }
+                }
             }
         }
         .onAppear { hasPassword = KeychainStore.load(account: profile.keychainAccount) != nil }
-        .onChange(of: profile) { _, newValue in model.saveProfile(newValue) }
+        // 只回写自动化字段：这份 profile 是打开页面时的副本，期间扩容改过的容量不能被它覆盖回去。
+        .onChange(of: profile) { _, newValue in model.saveAutomation(from: newValue) }
+    }
+
+    private func chooseBackupDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = profile.backupDirectoryURL
+        panel.prompt = "选择"
+        if panel.runModal() == .OK, let url = panel.url { profile.backupDirectory = url.path }
     }
 }

@@ -45,6 +45,16 @@ import Testing
         } }
     }
 
+    /// 极端权重比下剩余区域会先于条目耗尽，不能产生 NaN / 无穷大的矩形。
+    @Test func degenerateWeightsProduceFiniteRects() {
+        let items = [(id: 0, value: 1e18), (id: 1, value: 1e-12), (id: 2, value: 1e-12), (id: 3, value: 1e-12)]
+        let cells = Treemap.layout(items, in: CGRect(x: 0, y: 0, width: 100, height: 100))
+        #expect(!cells.isEmpty)
+        for cell in cells {
+            #expect(cell.rect.width.isFinite && cell.rect.height.isFinite && cell.rect.origin.x.isFinite && cell.rect.origin.y.isFinite)
+        }
+    }
+
     @Test func squarifiedKeepsAspectRatiosReasonable() {
         let items = (1...30).map { (id: $0, value: Double(100 - $0 * 3)) }
         let cells = Treemap.layout(items, in: CGRect(x: 0, y: 0, width: 800, height: 500))

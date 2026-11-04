@@ -119,8 +119,9 @@ public enum CleanupService {
                 }
                 let full = rootPath + "/" + clean
                 // 父目录解析后必须仍在卷内（防止经由符号链接目录删到卷外）。
-                let parent = ((full as NSString).deletingLastPathComponent as NSString).resolvingSymlinksInPath
-                guard MountTable.normalize(parent).hasPrefix(rootPath) else {
+                // 必须按路径分量比较：只比前缀会把 /Volumes/Cache2 当成 /Volumes/Cache 之内。
+                let parent = MountTable.normalize(((full as NSString).deletingLastPathComponent as NSString).resolvingSymlinksInPath)
+                guard parent == rootPath || parent.hasPrefix(rootPath + "/") else {
                     report.failures.append("\(rel)：路径越界")
                     continue
                 }
