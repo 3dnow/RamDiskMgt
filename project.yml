@@ -1,0 +1,48 @@
+name: RamDiskMgt
+options:
+  bundleIdPrefix: local.ramdiskmgt
+  deploymentTarget:
+    macOS: "27.0"
+  developmentLanguage: zh-Hans
+  createIntermediateGroups: true
+packages:
+  RamDiskKit:
+    path: Packages/RamDiskKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "27.0"
+targets:
+  RamDiskMgt:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+    dependencies:
+      - package: RamDiskKit
+        product: RamDiskKit
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: RamDiskMgt
+        CFBundleName: RamDiskMgt
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        CFBundleDevelopmentRegion: zh-Hans
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: "27.0"
+        NSHumanReadableCopyright: ""
+        CFBundleIconFile: AppIcon
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.ramdiskmgt.app
+        PRODUCT_NAME: RamDiskMgt
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_APP_SANDBOX: NO
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: YES
+        GENERATE_INFOPLIST_FILE: NO
+        COMBINE_HIDPI_IMAGES: YES
