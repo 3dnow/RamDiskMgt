@@ -18,6 +18,8 @@ brew install xcodegen   # 如未安装
 - `build/RamDiskMgt.app`：ad-hoc 签名，本机直接运行
 - `build/rdmctl`：命令行工具
 
+`RamDiskMgt.xcodeproj` 由 xcodegen 根据 `project.yml` 生成，不在仓库里。想用 Xcode 打开，先运行一次 `xcodegen generate`。
+
 ## 功能
 
 | 功能 | 说明 |
