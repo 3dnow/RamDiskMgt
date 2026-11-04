@@ -108,7 +108,7 @@ RDM_SUPPORT_DIR=/tmp/rdm-shots build/RamDiskMgt.app/Contents/MacOS/RamDiskMgt --
 - 第四条：把主要界面渲染成 PNG。
 - 第三、四条用到的诊断入口只在 Debug 构建里，Release 产物默认不带；要在 Release 上跑就用 `RDM_DIAGNOSTICS=1 ./scripts/build.sh` 构建。
 
-设计与实测结论见 [docs/设计文档.md](docs/设计文档.md)，测试记录见 [docs/测试报告.md](docs/测试报告.md)，代码审查结论见 [docs/代码审查-2026-11.md](docs/代码审查-2026-11.md)。
+设计与实测结论见 [docs/设计文档.md](docs/设计文档.md)，测试记录见 [docs/测试报告.md](docs/测试报告.md)，代码审查结论见 [docs/代码审查-2026-11.md](docs/代码审查-2026-11.md)，审查改动的本地验证步骤见 [docs/本地测试指南.md](docs/本地测试指南.md)。
 
 ## 目录结构
 
