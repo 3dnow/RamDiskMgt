@@ -566,32 +566,46 @@ final class AppModel {
     // MARK: - 挂载选项
 
     /// 修改运行中盘的 nobrowse / noexec / Spotlight；管理中的盘同步更新配置，重建时沿用。
+    /// tmpfs 的 nobrowse / noexec 不在线修改（见 `RamDiskManager.updateMountOptions`）：只写进配置，推出后重建时生效。
     @discardableResult
     func updateMountOptions(_ disk: RamDisk, hidden: Bool, noExec: Bool, spotlightDisabled: Bool?) -> Operation {
         run("修改“\(disk.name)”的挂载选项", mountPoint: disk.mountPoint) { op in
             if self.isBusy(disk.mountPoint, except: op) {
                 throw RamDiskError.operationFailed("“\(disk.name)”上有操作正在进行，请等它完成。")
             }
-            let options = MountOptions(hidden: hidden, noExec: noExec, disableSpotlight: spotlightDisabled ?? false)
-            op.phase = disk.backend.isRamDevice ? "重新挂载" : "更新挂载标志"
-            let updated: RamDisk
-            do {
-                updated = try await self.manager.updateMountOptions(disk, options: options, spotlightDisabled: spotlightDisabled)
-            } catch RamDiskError.busy(let holders) {
-                let proceed = await self.askAboutHolders(
-                    title: "“\(disk.name)”正在被使用",
-                    message: "修改 ram:// 盘的挂载选项要先卸载再重新挂载，这些程序打开的文件句柄会失效（盘上内容不受影响）。建议先关闭它们。",
-                    holders: holders, continueLabel: "继续")
-                guard proceed else { throw CancellationError() }
-                updated = try await self.manager.updateMountOptions(disk, options: options, spotlightDisabled: spotlightDisabled, force: true)
+            let flagsChanged = hidden != disk.hidden || noExec != disk.noExec
+            let flagsLive = flagsChanged && disk.backend.isRamDevice
+            if flagsChanged, !flagsLive, self.profile(for: disk) == nil {
+                throw RamDiskError.operationFailed("tmpfs 的 nobrowse / noexec 不能在运行中修改，需要推出后按新选项重建。这块盘不是本工具管理的，请先“纳入管理”，重建时才能带上新选项。")
             }
-            self.upsertDisk(updated)
+            if flagsLive || spotlightDisabled != nil {
+                // 运行中的盘只应用能在线改的部分：ram:// 盘的标志、两种后端的 Spotlight。
+                let live = MountOptions(hidden: flagsLive ? hidden : disk.hidden, noExec: flagsLive ? noExec : disk.noExec,
+                                        disableSpotlight: spotlightDisabled ?? false)
+                op.phase = flagsLive ? "重新挂载" : "更新 Spotlight 设置"
+                let updated: RamDisk
+                do {
+                    updated = try await self.manager.updateMountOptions(disk, options: live, spotlightDisabled: spotlightDisabled)
+                } catch RamDiskError.busy(let holders) {
+                    let proceed = await self.askAboutHolders(
+                        title: "“\(disk.name)”正在被使用",
+                        message: "修改 ram:// 盘的挂载选项要先卸载再重新挂载，这些程序打开的文件句柄会失效（盘上内容不受影响）。建议先关闭它们。",
+                        holders: holders, continueLabel: "继续")
+                    guard proceed else { throw CancellationError() }
+                    updated = try await self.manager.updateMountOptions(disk, options: live, spotlightDisabled: spotlightDisabled, force: true)
+                }
+                self.upsertDisk(updated)
+            }
             if var profile = self.profile(for: disk) {
                 profile.options.hidden = hidden
                 profile.options.noExec = noExec
                 if let spotlightDisabled { profile.options.disableSpotlight = spotlightDisabled }
                 try await self.profileStore.upsert(profile)
                 self.profiles = await self.profileStore.all()
+                if flagsChanged, !flagsLive {
+                    self.presentAlert(AppAlert(title: "已保存到配置，推出后重建时生效",
+                                               message: "tmpfs 的 nobrowse / noexec 不能在运行中修改。新的选项已保存到“\(disk.name)”的配置，这块盘推出后按配置重建时会带上。"))
+                }
             }
         }
     }

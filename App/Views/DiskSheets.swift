@@ -262,6 +262,7 @@ struct ResizeSheet: View {
 // MARK: - 挂载选项
 
 /// 修改运行中盘的 nobrowse / noexec / Spotlight（原来只能在创建时选，之后要改只能重建）。
+/// tmpfs 的挂载标志不在线改：只保存到配置，推出后重建时生效。
 struct MountOptionsSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
@@ -276,20 +277,29 @@ struct MountOptionsSheet: View {
         hidden == disk.hidden && noExec == disk.noExec && spotlightDisabled == spotlightInitial
     }
 
+    private var flagsChanged: Bool { hidden != disk.hidden || noExec != disk.noExec }
+    /// tmpfs 的标志只能写进配置；不是本工具管理的 tmpfs 连配置都没有，禁用这两个开关。
+    private var flagsEditable: Bool { disk.backend.isRamDevice || model.profile(for: disk) != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("修改“\(disk.name)”的挂载选项").appFont(.title3, weight: .semibold)
-            Toggle("在 Finder 中隐藏（nobrowse）", isOn: $hidden)
-            Toggle("禁止执行盘内程序（noexec）", isOn: $noExec)
+            Toggle("在 Finder 中隐藏（nobrowse）", isOn: $hidden).disabled(!flagsEditable)
+            Toggle("禁止执行盘内程序（noexec）", isOn: $noExec).disabled(!flagsEditable)
             Toggle("关闭 Spotlight 索引（改动时需要管理员密码）", isOn: $spotlightDisabled)
-            Text(disk.backend.isRamDevice
-                 ? "ram:// 盘要卸载后按新选项重新挂载，期间短暂不可用；打开着盘上文件的程序会失去句柄，盘上内容不受影响。"
-                 : "tmpfs 原地更新挂载标志，不影响已打开的文件；需要输入一次管理员密码。")
-                .appFont(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if disk.backend.isRamDevice {
+                Text("ram:// 盘要卸载后按新选项重新挂载，期间短暂不可用；打开着盘上文件的程序会失去句柄，盘上内容不受影响。")
+                    .appFont(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Callout(symbol: "info.circle", tint: Theme.warning,
+                        text: flagsEditable
+                            ? "tmpfs 的 nobrowse / noexec 不能在运行中修改：这两项的改动只保存到配置，推出后重建时生效。Spotlight 开关可以直接生效。"
+                            : "tmpfs 的 nobrowse / noexec 不能在运行中修改，需要推出后重建。这块盘不是本工具管理的，先在“概览 → 自动化”里纳入管理，重建时才能带上新选项。Spotlight 开关可以直接生效。")
+            }
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("应用") {
+                Button(!disk.backend.isRamDevice && flagsChanged ? "保存到配置" : "应用") {
                     model.updateMountOptions(disk, hidden: hidden, noExec: noExec,
                                              spotlightDisabled: spotlightDisabled == spotlightInitial ? nil : spotlightDisabled)
                     dismiss()
