@@ -81,6 +81,9 @@ public final class OsascriptExecutor: PrivilegedExecutor, @unchecked Sendable {
         let source = AppleScriptSource.adminShell(script, reason: reason)
         let start = Date()
         defer { record(reason, seconds: Date().timeIntervalSince(start)) }
+        // 前后各记一行：卡在授权或 root 命令里时，日志里只有“开始”没有“结束”。
+        DiagnosticsLog.append("privileged", "开始：\(reason)")
+        defer { DiagnosticsLog.append("privileged", "结束（\(String(format: "%.1f", Date().timeIntervalSince(start))) 秒）：\(reason)") }
         let result = try await Shell.run("/usr/bin/osascript", ["-e", source])
         guard result.succeeded else {
             if AppleScriptSource.isUserCancel(result.stderr) { throw PrivilegeError.cancelled }

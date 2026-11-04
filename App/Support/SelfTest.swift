@@ -18,6 +18,8 @@ enum SelfTest {
     }
 
     static func run() {
+        // 输出重定向到文件时默认整块缓冲，自检被中途终止会丢掉全部结果；改为按行写出。
+        setvbuf(stdout, nil, _IOLBF, 0)
         Task { @MainActor in
             let model = AppModel.shared
             var failures: [String] = []
