@@ -13,7 +13,7 @@ struct RamDiskMgtApp: App {
                 .environment(model)
                 .scaledFrame(minWidth: 940, minHeight: 620)
                 .appTextScale()
-                .onAppear { model.start() }
+                .onAppear { model.start(); model.surfaceAppeared() }
         }
         .windowToolbarStyle(.unified)
         .commands {
@@ -28,7 +28,7 @@ struct RamDiskMgtApp: App {
             MenuBarView()
                 .environment(model)
                 .appTextScale()
-                .onAppear { model.start() }
+                .onAppear { model.start(); model.surfaceAppeared() }
         } label: {
             Image(systemName: "memorychip")
         }

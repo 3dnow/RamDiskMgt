@@ -122,7 +122,7 @@ public actor ResizeService {
             progress?(ResizeProgress(phase: .verifying, message: "核对文件数与总字节数"))
             let actual = try FileSync.summary(of: URL(fileURLWithPath: disk.mountPoint))
             guard actual == expected else {
-                throw RamDiskError.operationFailed("校验不一致：原盘 \(expected.files) 个文件 / \(ByteSize.format(expected.bytes))，新盘 \(actual.files) 个文件 / \(ByteSize.format(actual.bytes))")
+                throw RamDiskError.operationFailed(Self.mismatchMessage(expected: expected, actual: actual) + "已回滚到原盘，请停掉正在写入的程序后重试。")
             }
             verified = true
 
@@ -210,7 +210,7 @@ public actor ResizeService {
             progress?(ResizeProgress(phase: .verifying, message: "核对文件数与总字节数"))
             let actual = try FileSync.summary(of: URL(fileURLWithPath: mp))
             guard actual == expected else {
-                throw RamDiskError.operationFailed("校验不一致：原盘 \(expected.files) 个文件，新盘 \(actual.files) 个文件。数据仍保留在暂存盘 \(stagingDisk.mountPoint)")
+                throw RamDiskError.operationFailed(Self.mismatchMessage(expected: expected, actual: actual) + "数据仍保留在暂存盘 \(stagingDisk.mountPoint)")
             }
 
             progress?(ResizeProgress(phase: .cleaningUp, message: "释放暂存盘"))
@@ -234,6 +234,14 @@ public actor ResizeService {
             // 原盘已卸载时保留暂存盘，数据不丢，错误信息里带有暂存路径。
             throw error
         }
+    }
+
+    /// 校验失败的说明。文件数和总字节数都一样时，是有文件在最后一轮同步之后被原地改写了（修改时间对不上）。
+    static func mismatchMessage(expected: TreeSummary, actual: TreeSummary) -> String {
+        if expected.sameCountsAndBytes(as: actual) {
+            return "校验不一致：文件数和总大小都相同，但有文件在切换前的最后一刻被改写（修改时间对不上）。"
+        }
+        return "校验不一致：原盘 \(expected.files) 个文件 / \(ByteSize.format(expected.bytes))，新盘 \(actual.files) 个文件 / \(ByteSize.format(actual.bytes))。"
     }
 
     /// `path` 现在是否仍是一个 tmpfs 挂载点的根。

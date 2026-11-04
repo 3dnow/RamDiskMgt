@@ -40,6 +40,41 @@ import Testing
         #expect(try FileSync.summary(of: src.url) == FileSync.summary(of: dst.url))
     }
 
+    /// 同大小的原地改写：文件数、总字节数都不变，只有修改时间变了，摘要必须能区分。
+    @Test func summaryDetectsSameSizeRewrite() throws {
+        let dir = TempDir("fp")
+        dir.write("a.bin", bytes: 4096, seed: 1)
+        dir.write("b.bin", bytes: 4096, seed: 2)
+        let before = try FileSync.summary(of: dir.url)
+        dir.write("a.bin", bytes: 4096, seed: 9)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)], ofItemAtPath: dir.path + "/a.bin")
+        let after = try FileSync.summary(of: dir.url)
+        #expect(before.sameCountsAndBytes(as: after))
+        #expect(before != after, "修改时间变了，指纹应不同")
+        // 顺序无关：同样的内容再算一次结果一致。
+        #expect(try FileSync.summary(of: dir.url) == after)
+    }
+
+    /// 复制进度：大文件复制中持续上报，字节数单调递增，最终等于总量。
+    @Test func progressIsMonotonicAndCompletes() async throws {
+        let src = TempDir("psrc")
+        src.write("big.bin", bytes: 24_000_000, seed: 5)
+        src.write("small.bin", bytes: 1_000, seed: 6)
+        let dst = TempDir("pdst")
+        final class Log: @unchecked Sendable {
+            let lock = NSLock()
+            var events: [SyncProgress] = []
+            func add(_ p: SyncProgress) { lock.lock(); events.append(p); lock.unlock() }
+        }
+        let log = Log()
+        _ = try await FileSync.sync(from: src.url, to: dst.url) { log.add($0) }
+        let copying = log.events.filter { $0.phase == .copying }
+        #expect(zip(copying, copying.dropFirst()).allSatisfy { $0.bytesDone <= $1.bytesDone }, "进度不应倒退")
+        #expect(copying.last?.bytesDone == 24_001_000)
+        #expect(copying.allSatisfy { $0.bytesDone <= $0.bytesTotal })
+        #expect(fingerprint(src.path) == fingerprint(dst.path))
+    }
+
     @Test func selectiveSyncWithoutMirror() async throws {
         let src = makeSource()
         let dst = TempDir("dst")

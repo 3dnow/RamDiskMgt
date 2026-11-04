@@ -248,6 +248,17 @@ struct ProfileAutomationEditor: View {
                     Label("还没有保存密码：定时备份和推出 / 退出时的备份都不会执行。", systemImage: "exclamationmark.triangle.fill")
                         .appFont(.callout).foregroundStyle(Theme.warning)
                 }
+                HStack(spacing: 12) {
+                    if let last = model.backups(for: profile).first(where: { $0.isAutomatic }) {
+                        Text("上次自动备份：\(last.createdAt.shortStamp)")
+                    } else {
+                        Text("还没有自动备份过")
+                    }
+                    if profile.autosave.intervalMinutes > 0, hasPassword, let next = model.nextAutosave[profile.id] {
+                        Text("下次约 \(next.shortStamp)")
+                    }
+                }
+                .appFont(.caption).foregroundStyle(.secondary)
                 HStack {
                     if hasPassword {
                         Label("备份密码已保存在钥匙串", systemImage: "key.fill").foregroundStyle(.secondary)

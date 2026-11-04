@@ -27,13 +27,21 @@ struct Args {
     var options: [String: String] = [:]
     var flags: Set<String> = []
 
+    /// 不带值的开关。否则 `resize --yes /Volumes/X --size 2G` 里的挂载点会被当成 --yes 的值。
+    static let booleanFlags: Set<String> = ["force", "yes", "hidden", "noexec", "replace", "dry-run"]
+
     init(_ raw: [String]) {
         var i = 0
         while i < raw.count {
             let a = raw[i]
             if a.hasPrefix("--") {
                 let key = String(a.dropFirst(2))
-                if i + 1 < raw.count, !raw[i + 1].hasPrefix("--") {
+                if let eq = key.firstIndex(of: "=") {
+                    options[String(key[..<eq])] = String(key[key.index(after: eq)...])
+                    i += 1
+                    continue
+                }
+                if !Self.booleanFlags.contains(key), i + 1 < raw.count, !raw[i + 1].hasPrefix("--") {
                     options[key] = raw[i + 1]
                     i += 2
                     continue

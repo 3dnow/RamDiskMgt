@@ -217,7 +217,9 @@ struct ResizeSheet: View {
                     step("1", "新建一块 \(ByteSize.format(newSize)) 的盘，原盘照常使用，同时全量复制")
                     step("2", "检查哪些程序开着原盘上的文件，必要时请你确认")
                     step("3", "增量复制改动，然后切换：新盘挂到 \(disk.mountPoint)")
-                    step("4", "核对文件数和总大小一致后，才释放旧盘；任何一步失败都会回滚")
+                    step("4", "核对文件数、总大小和修改时间一致后，才释放旧盘；任何一步失败都会回滚")
+                    Text("从增量同步结束到切换之间是一个极短的窗口，这期间程序写入原盘的内容不会带到新盘；校验发现这种改写会回滚。正在持续写入的程序最好先停掉。")
+                        .appFont(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Text(disk.backend == .tmpfs
                          ? "tmpfs 不能换挂载点：先复制到一块 ram:// 暂存盘，切换时再拷回，拷回期间盘不可用；会弹一次管理员密码框。"
                          : "迁移期间内存里会同时存在两份数据（约 \(ByteSize.format(disk.usedBytes))）。")

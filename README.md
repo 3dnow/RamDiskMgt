@@ -80,6 +80,8 @@ build/rdmctl clean /Volumes/Cache --min-size 200M
 
 设置环境变量 `RDM_SUPPORT_DIR` 可以把上面这些换到别的目录，测试时就是这么做的。
 
+tmpfs 相关的管理员命令在后台线程上执行，界面不会被卡住；排查问题时可设 `RDM_APPLESCRIPT_MAIN_THREAD=1` 改回在主线程执行。
+
 ## 开发与测试
 
 ```bash

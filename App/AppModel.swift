@@ -103,8 +103,13 @@ final class AppModel {
     /// 正在被操作（扩容切换中）的挂载点：刷新时暂时查不到也保留原条目，避免详情页闪“RAM 盘已不存在”。
     @ObservationIgnored private var pinnedMounts: Set<String> = []
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
-    @ObservationIgnored private var autosaveTasks: [UUID: Task<Void, Never>] = [:]
+    /// 每块盘的定时备份任务及其间隔；间隔没变就不重建，否则每保存一次配置计时就从头来。
+    @ObservationIgnored private var autosaveTasks: [UUID: (interval: Int, task: Task<Void, Never>)] = [:]
     @ObservationIgnored private var started = false
+    /// 上次完整枚举时的挂载表指纹；没变就不必再跑 hdiutil。
+    @ObservationIgnored private var lastMountSignature: Set<String> = []
+    /// 每块盘下一次定时备份的大约时间（界面显示用）。
+    var nextAutosave: [UUID: Date] = [:]
 
     init() {
         manager = RamDiskManager(privileged: executor)
@@ -129,19 +134,27 @@ final class AppModel {
         }
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
+                let visible = self?.hasVisibleWindow ?? false
+                try? await Task.sleep(for: .seconds(visible ? 2 : 15))
                 guard let self else { return }
                 self.memory = MemoryInfo.snapshot()
-                if Date().timeIntervalSince(self.lastRefresh) > 5 {
-                    await self.refreshDisks()
-                } else {
-                    self.disks = self.disks.map { $0.refreshed() }
-                }
+                await self.refreshDisksIfNeeded(maxAge: visible ? 60 : 300)
             }
         }
     }
 
+    /// 枚举 ram:// 设备要起一个 hdiutil 进程并解析 plist。挂载表指纹没变（没有卷挂上或卸下）就只用 statfs 刷新已知盘的容量，
+    /// 超过 `maxAge` 秒仍完整枚举一次兜底。原来不管有没有窗口都每 5 秒跑一次 hdiutil。
+    func refreshDisksIfNeeded(maxAge: TimeInterval) async {
+        if MountTable.signature() != lastMountSignature || Date().timeIntervalSince(lastRefresh) > maxAge {
+            await refreshDisks()
+        } else {
+            disks = disks.map { $0.refreshed() }
+        }
+    }
+
     func refreshDisks() async {
+        let signature = MountTable.signature()
         do {
             var fresh = try await manager.list()
             // 截图只拍演示盘，不把本机其他 RAM 盘的名字和用量带进截图。
@@ -151,8 +164,23 @@ final class AppModel {
             }
             disks = fresh
             lastRefresh = Date()
+            lastMountSignature = signature
         } catch {
             // 列表失败不打扰用户，下次再试。
+        }
+    }
+
+    /// 主窗口、菜单栏面板或设置窗口是否正显示。只剩菜单栏图标时（它的窗口只有菜单栏那么高）刷新降频。
+    /// 直接看 AppKit 窗口，不靠 onAppear / onDisappear 配对：菜单栏面板关闭时 SwiftUI 不一定拆掉视图。
+    var hasVisibleWindow: Bool {
+        NSApp.windows.contains { $0.isVisible && $0.frame.height > 100 }
+    }
+
+    /// 主窗口或菜单栏面板刚出现：立即刷新一次，不等后台循环。
+    func surfaceAppeared() {
+        Task {
+            memory = MemoryInfo.snapshot()
+            await refreshDisksIfNeeded(maxAge: 10)
         }
     }
 
@@ -502,7 +530,7 @@ final class AppModel {
             let options = ResizeOptions(confirmHolders: { holders in
                 await self.askAboutHolders(
                     title: "有程序正在使用“\(disk.name)”",
-                    message: "切换到新盘的瞬间，这些程序打开的文件句柄会失效（文件内容已完整复制到新盘）。建议先关闭它们。",
+                    message: "切换到新盘的瞬间，这些程序打开的文件句柄会失效（文件内容已完整复制到新盘）。它们在切换前最后一刻写入的内容不会带到新盘；校验发现这种改写会回滚。建议先关闭它们。",
                     holders: holders, continueLabel: "继续切换")
             })
             let result = try await self.resizer.resize(disk, to: newSize, options: options) { p in
@@ -510,6 +538,8 @@ final class AppModel {
                     op.phase = p.phase.displayName
                     op.detail = p.message
                     op.fraction = p.sync.map(\.fraction)
+                    op.bytesDone = p.sync?.bytesDone ?? 0
+                    op.bytesTotal = p.sync?.bytesTotal ?? 0
                 }
             }
             self.upsertDisk(result.disk)
@@ -697,18 +727,27 @@ final class AppModel {
 
     // MARK: - 自动备份
 
+    /// 按配置启停定时备份。只动新开启、间隔改变或已关闭的盘：原来每保存一次任何配置都把全部计时器清零重来。
     func rescheduleAutosave() {
-        for task in autosaveTasks.values { task.cancel() }
-        autosaveTasks.removeAll()
+        var wanted: [UUID: Int] = [:]
         for profile in profiles where profile.autosave.enabled && profile.autosave.intervalMinutes > 0 {
-            let id = profile.id
-            autosaveTasks[id] = Task { [weak self] in
+            wanted[profile.id] = profile.autosave.intervalMinutes
+        }
+        for (id, entry) in autosaveTasks where wanted[id] != entry.interval {
+            entry.task.cancel()
+            autosaveTasks[id] = nil
+            nextAutosave[id] = nil
+        }
+        for (id, minutes) in wanted where autosaveTasks[id] == nil {
+            let task = Task { [weak self] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(Double(profile.autosave.intervalMinutes) * 60))
+                    self?.nextAutosave[id] = Date().addingTimeInterval(Double(minutes) * 60)
+                    try? await Task.sleep(for: .seconds(Double(minutes) * 60))
                     guard !Task.isCancelled, let self else { return }
                     await self.autosave(profileID: id)
                 }
             }
+            autosaveTasks[id] = (minutes, task)
         }
     }
 
