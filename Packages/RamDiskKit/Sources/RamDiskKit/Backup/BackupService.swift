@@ -290,13 +290,7 @@ public actor BackupService {
 
     /// 备份目录整个搬家后：在 `directory`（含子目录）里按原文件名找回所有缺失的备份文件。返回找回的条数。
     public func relocateMissing(searching directory: URL) async throws -> Int {
-        var byName: [String: URL] = [:]
-        if let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey],
-                                                           options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
-            for case let url as URL in enumerator where (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
-                if byName[url.lastPathComponent] == nil { byName[url.lastPathComponent] = url }
-            }
-        }
+        let byName = Self.regularFilesByName(in: directory)
         var found = 0
         for record in await catalog.all() where !record.archiveExists {
             guard let candidate = byName[record.archiveURL.lastPathComponent] else { continue }
@@ -304,6 +298,17 @@ public actor BackupService {
             found += 1
         }
         return found
+    }
+
+    /// 同步遍历：DirectoryEnumerator 的迭代器不能在异步上下文里使用。同名文件取先遇到的那个。
+    private static func regularFilesByName(in directory: URL) -> [String: URL] {
+        var byName: [String: URL] = [:]
+        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey],
+                                                              options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return byName }
+        for case let url as URL in enumerator where (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            if byName[url.lastPathComponent] == nil { byName[url.lastPathComponent] = url }
+        }
+        return byName
     }
 
     /// 把外部的 .aea / .dmg 文件登记到备份库（例如重装系统后）。

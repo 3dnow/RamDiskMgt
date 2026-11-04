@@ -59,11 +59,19 @@ public struct TreeSummary: Sendable, Equatable {
 /// copyfile 进度回调的上下文：把已复制字节数转给 Swift 闭包。
 private final class CopyProgressBox {
     let report: (UInt64) -> Void
+    /// 出错阶段记下的 errno：返回 COPYFILE_QUIT 后 copyfile 不保证还保留它。
+    var errorCode: Int32 = 0
     init(_ report: @escaping (UInt64) -> Void) { self.report = report }
 }
 
 /// copyfile 在数据复制阶段每复制一块就回调一次（块大小由文件系统决定，通常 1MB 左右）。
 private let copyProgressCallback: copyfile_callback_t = { what, stage, state, _, _, context in
+    // 出错时必须放弃：对 COPYFILE_ERR 返回 CONTINUE，copyfile 会重写同一块数据（man copyfile），
+    // 盘满时每次都失败，于是无限重试、永远卡住。
+    if stage == COPYFILE_ERR {
+        if let context { Unmanaged<CopyProgressBox>.fromOpaque(context).takeUnretainedValue().errorCode = errno }
+        return COPYFILE_QUIT
+    }
     if what == COPYFILE_COPY_DATA, stage == COPYFILE_PROGRESS, let state, let context {
         var copied: off_t = 0
         if copyfile_state_get(state, UInt32(COPYFILE_STATE_COPIED), &copied) == 0 {
@@ -431,12 +439,13 @@ public enum FileSync {
         }
         try withExtendedLifetime(box) {
             if copyfile(from, to, state, flags) != 0 {
-                var code = errno
+                var code = box.map { $0.errorCode != 0 ? $0.errorCode : errno } ?? errno
                 if code == ENOENT {
                     // 父目录可能尚未创建（选择性同步时）。
                     try FileManager.default.createDirectory(atPath: (to as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                    box?.errorCode = 0
                     if copyfile(from, to, state, flags) == 0 { return }
-                    code = errno
+                    code = box.map { $0.errorCode != 0 ? $0.errorCode : errno } ?? errno
                 }
                 throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
             }
