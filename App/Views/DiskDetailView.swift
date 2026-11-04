@@ -91,6 +91,7 @@ struct OverviewTab: View {
     let disk: RamDisk
     @State private var holders: [ProcessHolder]?
     @State private var checking = false
+    @State private var showOptions = false
 
     var body: some View {
         ScrollView {
@@ -109,7 +110,15 @@ struct OverviewTab: View {
                     GridRow { key("设备"); Text(deviceText) }
                     GridRow { key("容量"); Text(ByteSize.format(disk.capacityBytes)) }
                     GridRow { key("实际占用内存"); Text("约 \(ByteSize.format(disk.usedBytes))（按需分配，未写入的部分不占内存）") }
-                    GridRow { key("挂载选项"); Text(optionsText) }
+                    GridRow {
+                        key("挂载选项")
+                        HStack(spacing: 10) {
+                            Text(optionsText)
+                            Button("修改…") { showOptions = true }
+                                .controlSize(.small)
+                                .disabled(model.isBusy(disk.mountPoint))
+                        }
+                    }
                     GridRow { key("说明"); Text(disk.backend.summary).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                 }
                 .appFont(.callout)
@@ -147,6 +156,9 @@ struct OverviewTab: View {
                 }
             }
             .padding(20)
+        }
+        .sheet(isPresented: $showOptions) {
+            MountOptionsSheet(disk: disk)
         }
     }
 

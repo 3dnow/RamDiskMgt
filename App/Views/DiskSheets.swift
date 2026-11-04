@@ -259,6 +259,65 @@ struct ResizeSheet: View {
     }
 }
 
+// MARK: - 挂载选项
+
+/// 修改运行中盘的 nobrowse / noexec / Spotlight（原来只能在创建时选，之后要改只能重建）。
+struct MountOptionsSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let disk: RamDisk
+    @State private var hidden = false
+    @State private var noExec = false
+    @State private var spotlightDisabled = false
+    /// 打开面板时 Spotlight 的实际状态（mdutil -s）；没变就不去动它，省一次管理员授权。
+    @State private var spotlightInitial = false
+
+    private var unchanged: Bool {
+        hidden == disk.hidden && noExec == disk.noExec && spotlightDisabled == spotlightInitial
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("修改“\(disk.name)”的挂载选项").appFont(.title3, weight: .semibold)
+            Toggle("在 Finder 中隐藏（nobrowse）", isOn: $hidden)
+            Toggle("禁止执行盘内程序（noexec）", isOn: $noExec)
+            Toggle("关闭 Spotlight 索引（改动时需要管理员密码）", isOn: $spotlightDisabled)
+            Text(disk.backend.isRamDevice
+                 ? "ram:// 盘要卸载后按新选项重新挂载，期间短暂不可用；打开着盘上文件的程序会失去句柄，盘上内容不受影响。"
+                 : "tmpfs 原地更新挂载标志，不影响已打开的文件；需要输入一次管理员密码。")
+                .appFont(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("应用") {
+                    model.updateMountOptions(disk, hidden: hidden, noExec: noExec,
+                                             spotlightDisabled: spotlightDisabled == spotlightInitial ? nil : spotlightDisabled)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(unchanged)
+            }
+        }
+        .padding(20)
+        .scaledFrame(width: 480)
+        .appTextScale()
+        .onAppear {
+            hidden = disk.hidden
+            noExec = disk.noExec
+            spotlightInitial = model.profile(for: disk)?.options.disableSpotlight ?? false
+            spotlightDisabled = spotlightInitial
+            Task {
+                // mdutil -s 输出 “Indexing enabled.” / “Indexing disabled.”，普通用户可读。
+                if let result = try? await Shell.run("/usr/bin/mdutil", ["-s", disk.mountPoint]), result.succeeded {
+                    let disabled = result.stdout.localizedCaseInsensitiveContains("disabled")
+                    spotlightInitial = disabled
+                    spotlightDisabled = disabled
+                }
+            }
+        }
+    }
+}
+
 // MARK: - 菜单栏
 
 struct MenuBarView: View {
@@ -352,6 +411,14 @@ struct SettingsView: View {
                 Text("也可以在任意窗口用 ⌘+ 放大、⌘- 缩小、⌘0 恢复默认。").appFont(.caption).foregroundStyle(.secondary)
             }
             Toggle("登录时启动 RamDiskMgt", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
+            if let note = model.launchAtLoginNote {
+                HStack(alignment: .top, spacing: 10) {
+                    Label(note, systemImage: "exclamationmark.triangle")
+                        .appFont(.caption).foregroundStyle(Theme.warning).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("打开登录项设置") { model.openLoginItemsSettings() }.controlSize(.small)
+                }
+            }
             LabeledContent("默认备份位置") {
                 HStack {
                     Text(AppPaths.defaultBackupDirectory.path).lineLimit(1).truncationMode(.middle)
@@ -379,6 +446,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .scaledFrame(width: 560)
         .padding()
+        .onAppear { model.refreshLoginItemStatus() }
     }
 }
 

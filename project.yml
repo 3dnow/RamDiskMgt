@@ -12,6 +12,10 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MACOSX_DEPLOYMENT_TARGET: "27.0"
+  configs:
+    Debug:
+      # 自检、截图、探针等诊断入口只编进 Debug；Release 要带上就 RDM_DIAGNOSTICS=1 ./scripts/build.sh
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG RDM_DIAGNOSTICS"
 targets:
   RamDiskMgt:
     type: application

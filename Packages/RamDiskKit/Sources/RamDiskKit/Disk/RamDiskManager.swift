@@ -308,6 +308,43 @@ public actor RamDiskManager {
         _ = try await privileged.runAsRoot(script, reason: "RamDiskMgt 需要管理员权限来推出 tmpfs 内存盘“\((mp as NSString).lastPathComponent)”。")
     }
 
+    // MARK: - 修改挂载选项
+
+    /// 修改已挂载盘的 nobrowse / noexec，以及 Spotlight 索引开关（`spotlightDisabled` 为 nil 表示不动）。
+    /// - ram:// 卷：卸载后按新选项重新挂载。期间短暂不可用，打开着文件的进程会失去句柄，所以先检查占用（`force` 跳过）。
+    /// - tmpfs：`mount_tmpfs -o update` 原地替换挂载标志（实测 update 会把标志整体换成给定的集合，见 docs/设计文档.md），
+    ///   需要管理员密码，不影响已打开的文件。
+    public func updateMountOptions(_ disk: RamDisk, options: MountOptions, spotlightDisabled: Bool?, force: Bool = false) async throws -> RamDisk {
+        let mp = MountTable.normalize(disk.mountPoint)
+        let spotlightCommand = spotlightDisabled.map { "/usr/bin/mdutil -i \($0 ? "off" : "on") \(ShellQuote.quote(mp)) >/dev/null 2>&1 || true" }
+        switch disk.backend {
+        case .tmpfs:
+            let opts = ["update"] + options.mountOptionList
+            var script = "set -e\n/sbin/mount_tmpfs -o \(opts.joined(separator: ",")) -s \(disk.deviceBytes) \(ShellQuote.quote(mp))"
+            if let spotlightCommand { script += "\n" + spotlightCommand }
+            _ = try await privileged.runAsRoot(script, reason: "RamDiskMgt 需要管理员权限来修改 tmpfs 内存盘“\(disk.name)”的挂载选项。")
+        case .apfs, .apfsCaseSensitive, .hfsPlus:
+            guard let volume = disk.volumeDevice else { throw RamDiskError.notFound(disk.mountPoint) }
+            if !force {
+                let holders = await ProcessHolders.holders(of: disk.mountPoint)
+                if !holders.isEmpty { throw RamDiskError.busy(holders) }
+            }
+            try await unmountVolume(volume, force: force)
+            do {
+                try await mountVolume(volume, volumeName: disk.name, at: disk.mountPoint, options: options)
+            } catch {
+                // 新选项挂不上就按原选项挂回去，不能让盘就此消失。
+                try? await mountVolume(volume, volumeName: disk.name, at: disk.mountPoint, options: disk.options)
+                throw error
+            }
+            if let spotlightCommand {
+                _ = try await privileged.runAsRoot(spotlightCommand, reason: "RamDiskMgt 需要管理员权限来修改该 RAM 盘的 Spotlight 索引设置。")
+            }
+        }
+        guard let updated = try await self.disk(at: mp) else { throw RamDiskError.operationFailed("修改挂载选项后找不到：\(mp)") }
+        return updated
+    }
+
     // MARK: - 供扩容使用的底层操作
 
     func unmountVolume(_ volumeDevice: String, force: Bool) async throws {

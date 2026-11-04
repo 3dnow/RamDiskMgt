@@ -149,6 +149,9 @@ struct TreeItem: Sendable {
     let kind: Kind
     let size: UInt64
     let mtime: timespec
+    /// inode 与硬链接数（lstat），用于在目标端重建硬链接。
+    let inode: UInt64
+    let links: Int
 }
 
 /// 选择集合：判断相对路径是否被选中，或是被选中路径的祖先目录。
@@ -201,6 +204,9 @@ public enum FileSync {
         var report = SyncReport()
         var copyJobs: [TreeItem] = []
         var directories: [TreeItem] = []
+        /// 源端有多个路径的 inode → 第一个遇到的路径；其余路径在复制阶段结束后用 link() 指向它的副本。
+        var hardLinkLeaders: [UInt64: String] = [:]
+        var linkJobs: [(item: TreeItem, leader: String)] = []
 
         // 目录与符号链接先串行处理，文件放入并发队列。
         for item in sourceItems {
@@ -227,6 +233,13 @@ public enum FileSync {
                     report.unchangedFiles += 1
                 }
             case .file:
+                if item.links > 1 {
+                    if let leader = hardLinkLeaders[item.inode] {
+                        linkJobs.append((item, leader))
+                        continue
+                    }
+                    hardLinkLeaders[item.inode] = item.path
+                }
                 if let existing = destIndex[item.path], existing.size == item.size, sameTime(existing.mtime, item.mtime) {
                     report.unchangedFiles += 1
                 } else {
@@ -279,6 +292,30 @@ public enum FileSync {
         report.errors += errors
         report.outOfSpace = outOfSpace
         report.failedBytes = failedBytes
+
+        // 硬链接：同一个源 inode 的其余路径，链接到第一个路径的副本（原来逐个复制成独立文件，目标端占用翻倍）。
+        if !linkJobs.isEmpty {
+            let recopied = Set(copyJobs.map(\.path))
+            for (item, leader) in linkJobs {
+                let target = dst + "/" + item.path
+                if !recopied.contains(leader), let existing = destIndex[item.path], let leaderExisting = destIndex[leader],
+                   existing.inode == leaderExisting.inode {
+                    report.unchangedFiles += 1
+                    continue
+                }
+                do {
+                    if FileManager.default.fileExists(atPath: target) || isSymlink(target) { try removeItem(atPath: target) }
+                    try FileManager.default.createDirectory(atPath: (target as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                    if link(dst + "/" + leader, target) != 0 {
+                        // 目标文件系统不支持硬链接等情况：退回独立复制。
+                        try copyItem(from: src + "/" + item.path, to: target)
+                    }
+                    report.copiedFiles += 1
+                } catch {
+                    report.errors.append("\(item.path)：\(error.localizedDescription)")
+                }
+            }
+        }
         var state = tracker.current
 
         if options.mirror {
@@ -362,7 +399,8 @@ public enum FileSync {
             }
             // 祖先目录本身只在“被选中或位于选中目录内”时才算作条目，但仍要进入。
             if let selection, kind != .directory, !selection.contains(rel) { continue }
-            items.append(TreeItem(path: rel, kind: kind, size: kind == .file ? UInt64(st.st_size) : 0, mtime: st.st_mtimespec))
+            items.append(TreeItem(path: rel, kind: kind, size: kind == .file ? UInt64(st.st_size) : 0, mtime: st.st_mtimespec,
+                                  inode: UInt64(st.st_ino), links: Int(st.st_nlink)))
             if kind == .directory { subdirs.append(rel) }
         }
         for sub in subdirs {

@@ -40,6 +40,30 @@ import Testing
         #expect(try FileSync.summary(of: src.url) == FileSync.summary(of: dst.url))
     }
 
+    /// 硬链接在目标端仍是同一个文件，而不是两份独立副本；再次同步不重复复制。
+    @Test func hardLinksArePreserved() async throws {
+        let src = TempDir("hl-src")
+        src.write("data/orig.bin", bytes: 5_000_000, seed: 7)
+        #expect(link(src.path + "/data/orig.bin", src.path + "/alias.bin") == 0)
+        src.write("plain.bin", bytes: 1_000, seed: 8)
+        let dst = TempDir("hl-dst")
+        func inode(_ path: String) -> UInt64 {
+            var st = stat()
+            return lstat(path, &st) == 0 ? UInt64(st.st_ino) : 0
+        }
+
+        let first = try await FileSync.sync(from: src.url, to: dst.url)
+        #expect(first.errors.isEmpty)
+        #expect(first.copiedFiles == 3)
+        #expect(inode(dst.path + "/data/orig.bin") == inode(dst.path + "/alias.bin"), "目标端应仍是同一个文件")
+        #expect(fingerprint(src.path) == fingerprint(dst.path))
+        #expect(try FileSync.summary(of: src.url) == FileSync.summary(of: dst.url))
+
+        let second = try await FileSync.sync(from: src.url, to: dst.url)
+        #expect(second.copiedFiles == 0 && second.errors.isEmpty, "没有变化就不该再复制")
+        #expect(inode(dst.path + "/data/orig.bin") == inode(dst.path + "/alias.bin"))
+    }
+
     /// 同大小的原地改写：文件数、总字节数都不变，只有修改时间变了，摘要必须能区分。
     @Test func summaryDetectsSameSizeRewrite() throws {
         let dir = TempDir("fp")

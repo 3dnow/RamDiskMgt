@@ -2,6 +2,10 @@ import AppKit
 import RamDiskKit
 import SwiftUI
 
+// 诊断入口只在定义了 RDM_DIAGNOSTICS 时编译（Debug 构建默认带；Release 用 RDM_DIAGNOSTICS=1 ./scripts/build.sh），
+// 正式产物里不再带自检、截图和探针代码。
+#if RDM_DIAGNOSTICS
+
 /// 自检截图：`RamDiskMgt --snapshot <目录>` 依次切换主要界面，把窗口渲染成 PNG 后退出。
 /// 在进程内用 cacheDisplay 渲染自己的窗口，不需要屏幕录制权限。
 enum DebugSnapshot {
@@ -167,3 +171,12 @@ enum DebugSnapshot {
         }
     }
 }
+#else
+
+enum DebugSnapshot {
+    static var fontScaleOverride: Double? { nil }
+    static var prefillPassword: String? { nil }
+    static var requestedDirectory: URL? { nil }
+    static func run(into directory: URL) {}
+}
+#endif

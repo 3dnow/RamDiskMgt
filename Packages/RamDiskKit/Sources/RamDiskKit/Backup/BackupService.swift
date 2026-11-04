@@ -274,6 +274,38 @@ public actor BackupService {
         }
     }
 
+    /// 备份文件被移动过：把记录指向新位置。只接受与记录同格式的文件。
+    @discardableResult
+    public func relocate(_ record: BackupRecord, to url: URL) async throws -> BackupRecord {
+        guard BackupFormat(rawValue: url.pathExtension.lowercased()) == record.format else {
+            throw BackupError.failed("文件格式与记录不符：这份记录是 .\(record.format.fileExtension)")
+        }
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        var updated = record
+        updated.archivePath = url.path
+        updated.archiveBytes = (attrs[.size] as? NSNumber)?.uint64Value ?? record.archiveBytes
+        try await catalog.update(updated)
+        return updated
+    }
+
+    /// 备份目录整个搬家后：在 `directory`（含子目录）里按原文件名找回所有缺失的备份文件。返回找回的条数。
+    public func relocateMissing(searching directory: URL) async throws -> Int {
+        var byName: [String: URL] = [:]
+        if let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey],
+                                                           options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
+            for case let url as URL in enumerator where (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                if byName[url.lastPathComponent] == nil { byName[url.lastPathComponent] = url }
+            }
+        }
+        var found = 0
+        for record in await catalog.all() where !record.archiveExists {
+            guard let candidate = byName[record.archiveURL.lastPathComponent] else { continue }
+            try await relocate(record, to: candidate)
+            found += 1
+        }
+        return found
+    }
+
     /// 把外部的 .aea / .dmg 文件登记到备份库（例如重装系统后）。
     public func importArchive(at url: URL, diskName: String? = nil) async throws -> BackupRecord {
         guard let format = BackupFormat(rawValue: url.pathExtension.lowercased()) else {

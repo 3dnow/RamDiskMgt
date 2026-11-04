@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import RamDiskKit
 import ServiceManagement
+import UniformTypeIdentifiers
 
 enum SidebarItem: Hashable {
     case disk(String)          // 挂载点
@@ -504,6 +505,14 @@ final class AppModel {
 
     /// 把一块外部创建的 RAM 盘纳入管理（保存配置）。
     func adopt(_ disk: RamDisk) {
+        // 名字要能原样用于重建；外部工具建的卷可能含有本工具不接受的字符。
+        do {
+            try RamDiskManager.validate(name: disk.name)
+        } catch {
+            presentAlert(AppAlert(title: "无法纳入管理",
+                                  message: "\(error.localizedDescription)。按这个名字无法重建。请先在 Finder 里给卷改名，或用本工具重新创建一块盘。"))
+            return
+        }
         let custom = disk.mountPoint == "/Volumes/\(disk.name)" ? nil : disk.mountPoint
         // ram:// 盘的卷容量比设备小（APFS 容器开销），按设备大小记，重建时才能得到同样大的盘。
         let size = disk.backend.isRamDevice && disk.deviceBytes > 0 ? disk.deviceBytes : disk.capacityBytes
@@ -551,6 +560,39 @@ final class AppModel {
             self.analyses[disk.mountPoint] = nil
             op.phase = "完成"
             op.detail = "切换耗时 \(String(format: "%.2f", result.switchDuration)) 秒"
+        }
+    }
+
+    // MARK: - 挂载选项
+
+    /// 修改运行中盘的 nobrowse / noexec / Spotlight；管理中的盘同步更新配置，重建时沿用。
+    @discardableResult
+    func updateMountOptions(_ disk: RamDisk, hidden: Bool, noExec: Bool, spotlightDisabled: Bool?) -> Operation {
+        run("修改“\(disk.name)”的挂载选项", mountPoint: disk.mountPoint) { op in
+            if self.isBusy(disk.mountPoint, except: op) {
+                throw RamDiskError.operationFailed("“\(disk.name)”上有操作正在进行，请等它完成。")
+            }
+            let options = MountOptions(hidden: hidden, noExec: noExec, disableSpotlight: spotlightDisabled ?? false)
+            op.phase = disk.backend.isRamDevice ? "重新挂载" : "更新挂载标志"
+            let updated: RamDisk
+            do {
+                updated = try await self.manager.updateMountOptions(disk, options: options, spotlightDisabled: spotlightDisabled)
+            } catch RamDiskError.busy(let holders) {
+                let proceed = await self.askAboutHolders(
+                    title: "“\(disk.name)”正在被使用",
+                    message: "修改 ram:// 盘的挂载选项要先卸载再重新挂载，这些程序打开的文件句柄会失效（盘上内容不受影响）。建议先关闭它们。",
+                    holders: holders, continueLabel: "继续")
+                guard proceed else { throw CancellationError() }
+                updated = try await self.manager.updateMountOptions(disk, options: options, spotlightDisabled: spotlightDisabled, force: true)
+            }
+            self.upsertDisk(updated)
+            if var profile = self.profile(for: disk) {
+                profile.options.hidden = hidden
+                profile.options.noExec = noExec
+                if let spotlightDisabled { profile.options.disableSpotlight = spotlightDisabled }
+                try await self.profileStore.upsert(profile)
+                self.profiles = await self.profileStore.all()
+            }
         }
     }
 
@@ -654,6 +696,46 @@ final class AppModel {
                 await reloadBackups()
             } catch {
                 presentAlert(AppAlert(title: "删除备份失败", message: error.localizedDescription))
+            }
+        }
+    }
+
+    /// 备份文件被移走了：让用户指出它现在的位置。
+    func relocateBackup(_ record: BackupRecord) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = record.format == .aea ? [UTType(filenameExtension: "aea") ?? .data] : [.diskImage]
+        panel.message = "找到 \(record.archiveURL.lastPathComponent) 现在的位置"
+        panel.directoryURL = record.archiveURL.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                _ = try await backupService.relocate(record, to: url)
+                await reloadBackups()
+            } catch {
+                presentAlert(AppAlert(title: "重新定位失败", message: error.localizedDescription))
+            }
+        }
+    }
+
+    /// 备份目录整个搬过家：在新目录里按文件名找回所有缺失的备份。
+    func relocateMissingBackups() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = "选择备份文件现在所在的文件夹（会连同子文件夹一起找）"
+        panel.prompt = "在这里找"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                let found = try await backupService.relocateMissing(searching: url)
+                await reloadBackups()
+                let missing = backups.filter { !$0.archiveExists }.count
+                presentAlert(AppAlert(title: "找回了 \(found) 份备份的文件",
+                                      message: missing == 0 ? "所有备份文件都已找到。" : "仍有 \(missing) 份找不到文件，可以逐个“重新定位”。"))
+            } catch {
+                presentAlert(AppAlert(title: "查找失败", message: error.localizedDescription))
             }
         }
     }
@@ -785,14 +867,42 @@ final class AppModel {
 
     // MARK: - 登录启动
 
+    /// 登录项状态。SMAppService 的状态不是可观察属性，改动后要手动刷新。
+    var loginItemStatus: SMAppService.Status = SMAppService.mainApp.status
+
+    func refreshLoginItemStatus() { loginItemStatus = SMAppService.mainApp.status }
+
     var launchAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
+        get { loginItemStatus == .enabled }
         set {
             do {
                 if newValue { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
             } catch {
                 presentAlert(AppAlert(title: "设置登录启动失败", message: error.localizedDescription))
             }
+            refreshLoginItemStatus()
+            if newValue, loginItemStatus == .requiresApproval {
+                presentAlert(AppAlert(title: "需要在系统设置里批准",
+                                      message: "系统已记录登录项，但要在“系统设置 → 通用 → 登录项与扩展”里允许 RamDiskMgt 后才会生效。"))
+            }
         }
     }
+
+    /// 登录项不生效的常见原因：ad-hoc 签名、不在“应用程序”文件夹的应用，系统可能拒绝注册，或在重新构建后找不到它。
+    var launchAtLoginNote: String? {
+        switch loginItemStatus {
+        case .requiresApproval:
+            return "等待在“系统设置 → 通用 → 登录项与扩展”里批准。"
+        case .notFound:
+            return "系统找不到这个登录项，通常是应用被移动或重新构建过。关掉再打开一次可以重新注册。"
+        default:
+            let path = Bundle.main.bundlePath
+            if !path.hasPrefix("/Applications/"), !path.hasPrefix(NSHomeDirectory() + "/Applications/") {
+                return "应用不在“应用程序”文件夹里（\(path)）。登录项记录的是当前位置，移动或重新构建后会失效；长期使用建议放到“应用程序”里并用固定证书签名（见 scripts/build.sh）。"
+            }
+            return nil
+        }
+    }
+
+    func openLoginItemsSettings() { SMAppService.openSystemSettingsLoginItems() }
 }

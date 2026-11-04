@@ -2,6 +2,10 @@ import AppKit
 import CryptoKit
 import RamDiskKit
 
+// 诊断入口只在定义了 RDM_DIAGNOSTICS 时编译（Debug 构建默认带；Release 用 RDM_DIAGNOSTICS=1 ./scripts/build.sh），
+// 正式产物里不再带自检、截图和探针代码。
+#if RDM_DIAGNOSTICS
+
 /// 端到端自检：`RamDiskMgt --selftest` 通过 AppModel（界面使用的同一层）跑完整流程，结束后以退出码报告结果。
 /// 只创建名为 RDMSelfTest 的 ram:// 盘，结束时推出。建议配合 RDM_SUPPORT_DIR 指向临时目录。
 enum SelfTest {
@@ -438,3 +442,20 @@ enum AlertSheetProbe {
         }
     }
 }
+#else
+
+enum SelfTest {
+    static var requested: Bool { false }
+    static func run() {}
+}
+
+enum CreateGapProbe {
+    static var requested: Bool { false }
+    static func run() {}
+}
+
+enum AlertSheetProbe {
+    static var mode: String? { nil }
+    static func run(_ mode: String) {}
+}
+#endif

@@ -50,8 +50,9 @@ public struct BackupRecord: Codable, Sendable, Hashable, Identifiable {
     public let diskCapacity: UInt64
     public let format: BackupFormat
     public let scope: BackupScope
-    public let archivePath: String
-    public let archiveBytes: UInt64
+    /// 备份文件的绝对路径；文件被移动后可用 `BackupService.relocate` 重新指向。
+    public var archivePath: String
+    public var archiveBytes: UInt64
     public let payloadBytes: UInt64
     public let fileCount: Int
     /// 钥匙串里存有这份备份的密码（本工具生成的备份存在 `keychainAccount(for:)` 下）。
