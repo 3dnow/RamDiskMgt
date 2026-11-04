@@ -81,7 +81,7 @@ final class AnalysisState {
 
 @Observable
 final class AppModel {
-    let executor = InProcessAppleScriptExecutor()
+    let executor = OsascriptExecutor()
     let manager: RamDiskManager
     let resizer: ResizeService
     let profileStore = ProfileStore()
