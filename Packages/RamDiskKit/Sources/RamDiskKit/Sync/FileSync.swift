@@ -33,6 +33,106 @@ public struct TreeSummary: Sendable, Equatable {
     public var directories = 0
     public var symlinks = 0
     public var bytes: UInt64 = 0
+    /// 全部文件 (路径, 大小, 修改时间秒) 的顺序无关指纹。只比文件数和总字节数时，
+    /// 同大小的原地改写（切换前最后一刻的写入）察觉不到；复制保留修改时间，所以指纹能对上。
+    public var fingerprint: UInt64 = 0
+
+    /// 文件数和总字节数相同、只有指纹不同：内容被改写过。
+    public func sameCountsAndBytes(as other: TreeSummary) -> Bool {
+        files == other.files && directories == other.directories && symlinks == other.symlinks && bytes == other.bytes
+    }
+
+    static func itemHash(_ path: String, size: UInt64, seconds: Int) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in path.utf8 { h = (h ^ UInt64(byte)) &* 0x0000_0100_0000_01b3 }
+        for value in [size, UInt64(bitPattern: Int64(seconds))] {
+            var v = value
+            for _ in 0..<8 {
+                h = (h ^ (v & 0xff)) &* 0x0000_0100_0000_01b3
+                v >>= 8
+            }
+        }
+        return h
+    }
+}
+
+/// copyfile 进度回调的上下文：把已复制字节数转给 Swift 闭包。
+private final class CopyProgressBox {
+    let report: (UInt64) -> Void
+    /// 出错阶段记下的 errno：返回 COPYFILE_QUIT 后 copyfile 不保证还保留它。
+    var errorCode: Int32 = 0
+    init(_ report: @escaping (UInt64) -> Void) { self.report = report }
+}
+
+/// copyfile 在数据复制阶段每复制一块就回调一次（块大小由文件系统决定，通常 1MB 左右）。
+private let copyProgressCallback: copyfile_callback_t = { what, stage, state, _, _, context in
+    // 出错时必须放弃：对 COPYFILE_ERR 返回 CONTINUE，copyfile 会重写同一块数据（man copyfile），
+    // 盘满时每次都失败，于是无限重试、永远卡住。
+    if stage == COPYFILE_ERR {
+        if let context { Unmanaged<CopyProgressBox>.fromOpaque(context).takeUnretainedValue().errorCode = errno }
+        return COPYFILE_QUIT
+    }
+    if what == COPYFILE_COPY_DATA, stage == COPYFILE_PROGRESS, let state, let context {
+        var copied: off_t = 0
+        if copyfile_state_get(state, UInt32(COPYFILE_STATE_COPIED), &copied) == 0 {
+            Unmanaged<CopyProgressBox>.fromOpaque(context).takeUnretainedValue().report(UInt64(max(0, copied)))
+        }
+    }
+    return COPYFILE_CONTINUE
+}
+
+/// 并发复制时的进度汇总：复制任务在多个线程上回调，大文件复制中也持续上报（原来按文件计，单个几 GB 的文件复制期间进度不动）。
+private final class SyncProgressTracker: @unchecked Sendable {
+    /// 小于这个大小的文件不报中间进度，省掉回调开销。
+    static let partialThreshold: UInt64 = 4 * ByteSize.mib
+    private let lock = NSLock()
+    private var state: SyncProgress
+    private var inFlight: [String: UInt64] = [:]
+    private var lastReport = Date.distantPast
+    private let report: (@Sendable (SyncProgress) -> Void)?
+
+    init(filesTotal: Int, bytesTotal: UInt64, report: (@Sendable (SyncProgress) -> Void)?) {
+        state = SyncProgress(phase: .copying, filesTotal: filesTotal, filesDone: 0, bytesTotal: bytesTotal, bytesDone: 0, currentPath: "")
+        self.report = report
+        report?(state)
+    }
+
+    /// 已完成的字节 + 正在复制的文件各自已复制的部分。
+    private func snapshot() -> SyncProgress {
+        var s = state
+        s.bytesDone += inFlight.values.reduce(0, +)
+        return s
+    }
+
+    /// 单个文件复制中的部分进度；最多每 0.1 秒上报一次。
+    func partial(_ path: String, copied: UInt64, of size: UInt64) {
+        lock.lock()
+        inFlight[path] = min(copied, size)
+        let now = Date()
+        guard now.timeIntervalSince(lastReport) >= 0.1 else { lock.unlock(); return }
+        lastReport = now
+        var s = snapshot()
+        s.currentPath = path
+        lock.unlock()
+        report?(s)
+    }
+
+    func finished(_ item: TreeItem) {
+        lock.lock()
+        inFlight[item.path] = nil
+        state.filesDone += 1
+        state.bytesDone += item.size
+        state.currentPath = item.path
+        let s = snapshot()
+        lock.unlock()
+        report?(s)
+    }
+
+    /// 复制阶段结束后的状态，供删除、收尾阶段沿用。
+    var current: SyncProgress {
+        lock.lock(); defer { lock.unlock() }
+        return state
+    }
 }
 
 public struct SyncOptions: Sendable {
@@ -57,6 +157,9 @@ struct TreeItem: Sendable {
     let kind: Kind
     let size: UInt64
     let mtime: timespec
+    /// inode 与硬链接数（lstat），用于在目标端重建硬链接。
+    let inode: UInt64
+    let links: Int
 }
 
 /// 选择集合：判断相对路径是否被选中，或是被选中路径的祖先目录。
@@ -109,6 +212,9 @@ public enum FileSync {
         var report = SyncReport()
         var copyJobs: [TreeItem] = []
         var directories: [TreeItem] = []
+        /// 源端有多个路径的 inode → 第一个遇到的路径；其余路径在复制阶段结束后用 link() 指向它的副本。
+        var hardLinkLeaders: [UInt64: String] = [:]
+        var linkJobs: [(item: TreeItem, leader: String)] = []
 
         // 目录与符号链接先串行处理，文件放入并发队列。
         for item in sourceItems {
@@ -135,6 +241,13 @@ public enum FileSync {
                     report.unchangedFiles += 1
                 }
             case .file:
+                if item.links > 1 {
+                    if let leader = hardLinkLeaders[item.inode] {
+                        linkJobs.append((item, leader))
+                        continue
+                    }
+                    hardLinkLeaders[item.inode] = item.path
+                }
                 if let existing = destIndex[item.path], existing.size == item.size, sameTime(existing.mtime, item.mtime) {
                     report.unchangedFiles += 1
                 } else {
@@ -146,8 +259,7 @@ public enum FileSync {
         }
 
         let bytesTotal = copyJobs.reduce(UInt64(0)) { $0 + $1.size }
-        var state = SyncProgress(phase: .copying, filesTotal: copyJobs.count, filesDone: 0, bytesTotal: bytesTotal, bytesDone: 0, currentPath: "")
-        progress?(state)
+        let tracker = SyncProgressTracker(filesTotal: copyJobs.count, bytesTotal: bytesTotal, report: progress)
 
         let parallelism = max(1, options.parallelism)
         var errors: [String] = []
@@ -159,8 +271,11 @@ public enum FileSync {
                 guard let job = iterator.next() else { return false }
                 group.addTask {
                     try Task.checkCancellation()
+                    let onProgress: ((UInt64) -> Void)? = job.size >= SyncProgressTracker.partialThreshold
+                        ? { copied in tracker.partial(job.path, copied: copied, of: job.size) }
+                        : nil
                     do {
-                        try copyItem(from: src + "/" + job.path, to: dst + "/" + job.path)
+                        try copyItem(from: src + "/" + job.path, to: dst + "/" + job.path, progress: onProgress)
                         return (job, nil, false)
                     } catch {
                         return (job, "\(job.path)：\(error.localizedDescription)", RestoreSizing.isOutOfSpace(error))
@@ -178,16 +293,38 @@ public enum FileSync {
                     report.copiedFiles += 1
                     report.copiedBytes += job.size
                 }
-                state.filesDone += 1
-                state.bytesDone += job.size
-                state.currentPath = job.path
-                progress?(state)
+                tracker.finished(job)
                 _ = addNext()
             }
         }
         report.errors += errors
         report.outOfSpace = outOfSpace
         report.failedBytes = failedBytes
+
+        // 硬链接：同一个源 inode 的其余路径，链接到第一个路径的副本（原来逐个复制成独立文件，目标端占用翻倍）。
+        if !linkJobs.isEmpty {
+            let recopied = Set(copyJobs.map(\.path))
+            for (item, leader) in linkJobs {
+                let target = dst + "/" + item.path
+                if !recopied.contains(leader), let existing = destIndex[item.path], let leaderExisting = destIndex[leader],
+                   existing.inode == leaderExisting.inode {
+                    report.unchangedFiles += 1
+                    continue
+                }
+                do {
+                    if FileManager.default.fileExists(atPath: target) || isSymlink(target) { try removeItem(atPath: target) }
+                    try FileManager.default.createDirectory(atPath: (target as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                    if link(dst + "/" + leader, target) != 0 {
+                        // 目标文件系统不支持硬链接等情况：退回独立复制。
+                        try copyItem(from: src + "/" + item.path, to: target)
+                    }
+                    report.copiedFiles += 1
+                } catch {
+                    report.errors.append("\(item.path)：\(error.localizedDescription)")
+                }
+            }
+        }
+        var state = tracker.current
 
         if options.mirror {
             state.phase = .deleting
@@ -221,7 +358,10 @@ public enum FileSync {
         var s = TreeSummary()
         for item in try scan(root: root.path, selection: selection.map(PathSelection.init)) {
             switch item.kind {
-            case .file: s.files += 1; s.bytes += item.size
+            case .file:
+                s.files += 1
+                s.bytes += item.size
+                s.fingerprint &+= TreeSummary.itemHash(item.path, size: item.size, seconds: item.mtime.tv_sec)
             case .directory: s.directories += 1
             case .symlink: s.symlinks += 1
             case .other: break
@@ -267,7 +407,8 @@ public enum FileSync {
             }
             // 祖先目录本身只在“被选中或位于选中目录内”时才算作条目，但仍要进入。
             if let selection, kind != .directory, !selection.contains(rel) { continue }
-            items.append(TreeItem(path: rel, kind: kind, size: kind == .file ? UInt64(st.st_size) : 0, mtime: st.st_mtimespec))
+            items.append(TreeItem(path: rel, kind: kind, size: kind == .file ? UInt64(st.st_size) : 0, mtime: st.st_mtimespec,
+                                  inode: UInt64(st.st_ino), links: Int(st.st_nlink)))
             if kind == .directory { subdirs.append(rel) }
         }
         for sub in subdirs {
@@ -286,16 +427,28 @@ public enum FileSync {
     }
 
     /// 复制单个文件或符号链接（不跟随链接），保留全部元数据，目标已存在时先删除。
-    static func copyItem(from: String, to: String) throws {
+    /// - Parameter progress: 数据复制过程中的已复制字节数（大文件进度）。
+    static func copyItem(from: String, to: String, progress: ((UInt64) -> Void)? = nil) throws {
         let flags = copyfile_flags_t(COPYFILE_ALL | COPYFILE_NOFOLLOW | COPYFILE_UNLINK)
-        if copyfile(from, to, nil, flags) != 0 {
-            let code = errno
-            if code == ENOENT {
-                // 父目录可能尚未创建（选择性同步时）。
-                try FileManager.default.createDirectory(atPath: (to as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-                if copyfile(from, to, nil, flags) == 0 { return }
+        let box = progress.map(CopyProgressBox.init)
+        let state = copyfile_state_alloc()
+        defer { copyfile_state_free(state) }
+        if let box {
+            _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CB), unsafeBitCast(copyProgressCallback, to: UnsafeRawPointer.self))
+            _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CTX), Unmanaged.passUnretained(box).toOpaque())
+        }
+        try withExtendedLifetime(box) {
+            if copyfile(from, to, state, flags) != 0 {
+                var code = box.map { $0.errorCode != 0 ? $0.errorCode : errno } ?? errno
+                if code == ENOENT {
+                    // 父目录可能尚未创建（选择性同步时）。
+                    try FileManager.default.createDirectory(atPath: (to as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                    box?.errorCode = 0
+                    if copyfile(from, to, state, flags) == 0 { return }
+                    code = box.map { $0.errorCode != 0 ? $0.errorCode : errno } ?? errno
+                }
+                throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
             }
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 

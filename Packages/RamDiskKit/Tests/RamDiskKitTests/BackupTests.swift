@@ -50,6 +50,36 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: target.path + "/" + AEAEngine.manifestName))
     }
 
+    @Test func sameSecondBackupsGetDistinctFileNames() throws {
+        let dir = TempDir("names")
+        let first = BackupService.uniqueDestination(in: dir.url, fileName: "Cache-20261104-120000.aea")
+        #expect(first.hasSuffix("/Cache-20261104-120000.aea"))
+        try Data().write(to: URL(fileURLWithPath: first))
+        let second = BackupService.uniqueDestination(in: dir.url, fileName: "Cache-20261104-120000.aea")
+        #expect(second.hasSuffix("/Cache-20261104-120000-2.aea"))
+        try Data().write(to: URL(fileURLWithPath: second))
+        let third = BackupService.uniqueDestination(in: dir.url, fileName: "Cache-20261104-120000.aea")
+        #expect(third.hasSuffix("/Cache-20261104-120000-3.aea"))
+    }
+
+    @Test func relocateMissingFindsMovedArchives() async throws {
+        let volume = makeVolume()
+        let support = TempDir("support")
+        let svc = service(support)
+        let record = try await svc.create(BackupRequest(disk: fakeDisk(volume), profileID: nil, scope: .full, format: .aea,
+                                                        password: password, destinationDirectory: support.url))
+        let moved = TempDir("moved")
+        let target = moved.url.appendingPathComponent("sub/\(record.archiveURL.lastPathComponent)")
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: record.archiveURL, to: target)
+        #expect(try await svc.relocateMissing(searching: moved.url) == 1)
+        let updated = try #require(await svc.catalog.record(id: record.id))
+        // 枚举器会把 /var 解析成 /private/var，按解析后的路径比较。
+        #expect(URL(fileURLWithPath: updated.archivePath).resolvingSymlinksInPath() == target.resolvingSymlinksInPath() && updated.archiveExists,
+                "实际 \(updated.archivePath)，期望 \(target.path)")
+        #expect(try await svc.relocateMissing(searching: moved.url) == 0, "已找回的不再重复处理")
+    }
+
     @Test(arguments: BackupFormat.allCases)
     func partialBackupAndPartialRestore(format: BackupFormat) async throws {
         let volume = makeVolume()

@@ -42,6 +42,9 @@ struct BackupTab: View {
                         if let record { NSWorkspace.shared.activateFileViewerSelecting([record.archiveURL]) }
                     }
                     .disabled(record == nil)
+                    Button("重新定位…") { if let record { model.relocateBackup(record) } }
+                        .disabled(record?.archiveExists != false)
+                        .help("备份文件被移走时，指出它现在的位置")
                     Spacer()
                     Button("删除备份…", role: .destructive) { deleteTarget = record }.disabled(record == nil)
                 }
@@ -529,6 +532,10 @@ struct BackupLibraryView: View {
                     Text("\(model.backups.count) 份备份，共 \(ByteSize.format(total))").foregroundStyle(.secondary)
                 }
                 Spacer()
+                if model.backups.contains(where: { !$0.archiveExists }) {
+                    Button("找回缺失的备份文件…") { model.relocateMissingBackups() }
+                        .help("备份目录搬过家后，在新位置按文件名找回全部缺失的备份")
+                }
                 Button("导入备份文件…") { importFile() }
             }
             .padding(16)
@@ -546,6 +553,9 @@ struct BackupLibraryView: View {
                         if let record { NSWorkspace.shared.activateFileViewerSelecting([record.archiveURL]) }
                     }
                     .disabled(record == nil)
+                    Button("重新定位…") { if let record { model.relocateBackup(record) } }
+                        .disabled(record?.archiveExists != false)
+                        .help("备份文件被移走时，指出它现在的位置")
                     Spacer()
                     Button("删除…", role: .destructive) { deleteTarget = record }.disabled(record == nil)
                 }

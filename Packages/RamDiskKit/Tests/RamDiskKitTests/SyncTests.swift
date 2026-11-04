@@ -40,6 +40,65 @@ import Testing
         #expect(try FileSync.summary(of: src.url) == FileSync.summary(of: dst.url))
     }
 
+    /// 硬链接在目标端仍是同一个文件，而不是两份独立副本；再次同步不重复复制。
+    @Test func hardLinksArePreserved() async throws {
+        let src = TempDir("hl-src")
+        src.write("data/orig.bin", bytes: 5_000_000, seed: 7)
+        #expect(link(src.path + "/data/orig.bin", src.path + "/alias.bin") == 0)
+        src.write("plain.bin", bytes: 1_000, seed: 8)
+        let dst = TempDir("hl-dst")
+        func inode(_ path: String) -> UInt64 {
+            var st = stat()
+            return lstat(path, &st) == 0 ? UInt64(st.st_ino) : 0
+        }
+
+        let first = try await FileSync.sync(from: src.url, to: dst.url)
+        #expect(first.errors.isEmpty)
+        #expect(first.copiedFiles == 3)
+        #expect(inode(dst.path + "/data/orig.bin") == inode(dst.path + "/alias.bin"), "目标端应仍是同一个文件")
+        #expect(fingerprint(src.path) == fingerprint(dst.path))
+        #expect(try FileSync.summary(of: src.url) == FileSync.summary(of: dst.url))
+
+        let second = try await FileSync.sync(from: src.url, to: dst.url)
+        #expect(second.copiedFiles == 0 && second.errors.isEmpty, "没有变化就不该再复制")
+        #expect(inode(dst.path + "/data/orig.bin") == inode(dst.path + "/alias.bin"))
+    }
+
+    /// 同大小的原地改写：文件数、总字节数都不变，只有修改时间变了，摘要必须能区分。
+    @Test func summaryDetectsSameSizeRewrite() throws {
+        let dir = TempDir("fp")
+        dir.write("a.bin", bytes: 4096, seed: 1)
+        dir.write("b.bin", bytes: 4096, seed: 2)
+        let before = try FileSync.summary(of: dir.url)
+        dir.write("a.bin", bytes: 4096, seed: 9)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)], ofItemAtPath: dir.path + "/a.bin")
+        let after = try FileSync.summary(of: dir.url)
+        #expect(before.sameCountsAndBytes(as: after))
+        #expect(before != after, "修改时间变了，指纹应不同")
+        // 顺序无关：同样的内容再算一次结果一致。
+        #expect(try FileSync.summary(of: dir.url) == after)
+    }
+
+    /// 复制进度：大文件复制中持续上报，字节数单调递增，最终等于总量。
+    @Test func progressIsMonotonicAndCompletes() async throws {
+        let src = TempDir("psrc")
+        src.write("big.bin", bytes: 24_000_000, seed: 5)
+        src.write("small.bin", bytes: 1_000, seed: 6)
+        let dst = TempDir("pdst")
+        final class Log: @unchecked Sendable {
+            let lock = NSLock()
+            var events: [SyncProgress] = []
+            func add(_ p: SyncProgress) { lock.lock(); events.append(p); lock.unlock() }
+        }
+        let log = Log()
+        _ = try await FileSync.sync(from: src.url, to: dst.url) { log.add($0) }
+        let copying = log.events.filter { $0.phase == .copying }
+        #expect(zip(copying, copying.dropFirst()).allSatisfy { $0.bytesDone <= $1.bytesDone }, "进度不应倒退")
+        #expect(copying.last?.bytesDone == 24_001_000)
+        #expect(copying.allSatisfy { $0.bytesDone <= $0.bytesTotal })
+        #expect(fingerprint(src.path) == fingerprint(dst.path))
+    }
+
     @Test func selectiveSyncWithoutMirror() async throws {
         let src = makeSource()
         let dst = TempDir("dst")
@@ -119,6 +178,20 @@ import Testing
         let report = await CleanupService.delete(relativePaths: ["evil/victim.txt"], root: root.path)
         #expect(report.deletedCount == 0)
         #expect(FileManager.default.fileExists(atPath: outside.path + "/victim.txt"))
+    }
+
+    /// 卷外目录的路径恰好以卷路径开头（/Volumes/Cache 与 /Volumes/Cache2）：只比字符串前缀会放行。
+    @Test func cleanupRefusesSiblingWithSamePrefix() async throws {
+        let root = TempDir("root")
+        let sibling = root.path + "2"
+        try FileManager.default.createDirectory(atPath: sibling, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: sibling) }
+        try Data("must survive".utf8).write(to: URL(fileURLWithPath: sibling + "/victim.txt"))
+        root.symlink("evil", to: sibling)
+        let report = await CleanupService.delete(relativePaths: ["evil/victim.txt"], root: root.path)
+        #expect(report.deletedCount == 0)
+        #expect(report.failures.count == 1)
+        #expect(FileManager.default.fileExists(atPath: sibling + "/victim.txt"))
     }
 }
 

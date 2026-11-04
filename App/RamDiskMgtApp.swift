@@ -13,7 +13,7 @@ struct RamDiskMgtApp: App {
                 .environment(model)
                 .scaledFrame(minWidth: 940, minHeight: 620)
                 .appTextScale()
-                .onAppear { model.start() }
+                .onAppear { model.start(); model.surfaceAppeared() }
         }
         .windowToolbarStyle(.unified)
         .commands {
@@ -28,7 +28,7 @@ struct RamDiskMgtApp: App {
             MenuBarView()
                 .environment(model)
                 .appTextScale()
-                .onAppear { model.start() }
+                .onAppear { model.start(); model.surfaceAppeared() }
         } label: {
             Image(systemName: "memorychip")
         }
@@ -64,7 +64,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let model = AppModel.shared
-        guard model.needsBackupBeforeQuit, DebugSnapshot.requestedDirectory == nil, !SelfTest.requested, !CreateGapProbe.requested else { return .terminateNow }
+        let testing = DebugSnapshot.requestedDirectory != nil || SelfTest.requested || CreateGapProbe.requested
+        // 扩容切换到一半、还原写到一半时退出，盘会留在不完整的状态；先问一声。
+        if !testing, model.isBusy {
+            let running = model.operations.filter { !$0.finished }.map(\.title).joined(separator: "、")
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "有操作正在进行"
+            alert.informativeText = "\(running)。现在退出会让它中断，盘上的内容可能不完整。"
+            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: "仍然退出")
+            if alert.runModal() == .alertFirstButtonReturn { return .terminateCancel }
+        }
+        guard model.needsBackupBeforeQuit, !testing else { return .terminateNow }
         Task {
             await model.backupBeforeQuit()
             sender.reply(toApplicationShouldTerminate: true)

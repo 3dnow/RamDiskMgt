@@ -61,12 +61,29 @@ enum AppleScriptSource {
     }
 }
 
-/// 每次调用都启动一个 osascript 进程，弹出系统管理员授权框（命令行场景）。
-public struct OsascriptExecutor: PrivilegedExecutor {
+/// 每次调用都启动一个 osascript 进程，弹出系统管理员授权框。命令行和 App 都用它。
+/// 脚本在子进程里执行，不占主线程；NSAppleScript 按苹果的线程安全说明只能在主线程使用，在主线程同步执行又会让界面冻结到 root 命令跑完。
+/// 实测 macOS 27 上不存在“5 分钟授权缓存”，每次调用都会弹出授权框（见 docs/测试报告.md），
+/// 所以调用方应把一次操作需要的 root 命令合并成一个脚本。
+public final class OsascriptExecutor: PrivilegedExecutor, @unchecked Sendable {
+    private let lock = NSLock()
+    private var log: [(reason: String, seconds: Double)] = []
+
     public init() {}
+
+    /// 本进程内的调用次数与耗时（含用户输入密码的时间）。
+    public var callLog: [(reason: String, seconds: Double)] {
+        lock.lock(); defer { lock.unlock() }
+        return log
+    }
 
     public func runAsRoot(_ script: String, reason: String) async throws -> String {
         let source = AppleScriptSource.adminShell(script, reason: reason)
+        let start = Date()
+        defer { record(reason, seconds: Date().timeIntervalSince(start)) }
+        // 前后各记一行：卡在授权或 root 命令里时，日志里只有“开始”没有“结束”。
+        DiagnosticsLog.append("privileged", "开始：\(reason)")
+        defer { DiagnosticsLog.append("privileged", "结束（\(String(format: "%.1f", Date().timeIntervalSince(start))) 秒）：\(reason)") }
         let result = try await Shell.run("/usr/bin/osascript", ["-e", source])
         guard result.succeeded else {
             if AppleScriptSource.isUserCancel(result.stderr) { throw PrivilegeError.cancelled }
@@ -74,36 +91,8 @@ public struct OsascriptExecutor: PrivilegedExecutor {
         }
         return result.stdout
     }
-}
 
-/// 在本进程内用 NSAppleScript 执行（GUI 场景）。
-/// 注意：实测 macOS 27 上不存在“5 分钟授权缓存”，每次调用都会弹出授权框（见 docs/测试报告.md），
-/// 所以调用方应把一次操作需要的 root 命令合并成一个脚本。
-@MainActor
-public final class InProcessAppleScriptExecutor: PrivilegedExecutor {
-    public init() {}
-
-    public nonisolated func runAsRoot(_ script: String, reason: String) async throws -> String {
-        try await execute(AppleScriptSource.adminShell(script, reason: reason))
-    }
-
-    /// 本进程内调用次数与耗时（用于验证授权缓存：缓存命中时调用几乎不耗时）。
-    public private(set) var callLog: [(reason: String, seconds: Double)] = []
-
-    private func execute(_ source: String) throws -> String {
-        let start = Date()
-        defer { callLog.append((String(source.suffix(80)), Date().timeIntervalSince(start))) }
-        guard let appleScript = NSAppleScript(source: source) else {
-            throw PrivilegeError.failed("无法编译 AppleScript")
-        }
-        var errorInfo: NSDictionary?
-        let output = appleScript.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            let number = errorInfo[NSAppleScript.errorNumber] as? Int ?? 0
-            let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "未知错误"
-            if number == -128 { throw PrivilegeError.cancelled }
-            throw PrivilegeError.failed(message)
-        }
-        return output.stringValue ?? ""
+    private func record(_ reason: String, seconds: Double) {
+        lock.lock(); log.append((reason, seconds)); lock.unlock()
     }
 }

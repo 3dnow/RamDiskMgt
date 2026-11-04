@@ -91,6 +91,7 @@ struct OverviewTab: View {
     let disk: RamDisk
     @State private var holders: [ProcessHolder]?
     @State private var checking = false
+    @State private var showOptions = false
 
     var body: some View {
         ScrollView {
@@ -109,7 +110,15 @@ struct OverviewTab: View {
                     GridRow { key("设备"); Text(deviceText) }
                     GridRow { key("容量"); Text(ByteSize.format(disk.capacityBytes)) }
                     GridRow { key("实际占用内存"); Text("约 \(ByteSize.format(disk.usedBytes))（按需分配，未写入的部分不占内存）") }
-                    GridRow { key("挂载选项"); Text(optionsText) }
+                    GridRow {
+                        key("挂载选项")
+                        HStack(spacing: 10) {
+                            Text(optionsText)
+                            Button("修改…") { showOptions = true }
+                                .controlSize(.small)
+                                .disabled(model.isBusy(disk.mountPoint))
+                        }
+                    }
                     GridRow { key("说明"); Text(disk.backend.summary).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                 }
                 .appFont(.callout)
@@ -147,6 +156,9 @@ struct OverviewTab: View {
                 }
             }
             .padding(20)
+        }
+        .sheet(isPresented: $showOptions) {
+            MountOptionsSheet(disk: disk)
         }
     }
 
@@ -244,6 +256,21 @@ struct ProfileAutomationEditor: View {
                     }
                     .scaledFrame(width: 140)
                 }
+                if !hasPassword {
+                    Label("还没有保存密码：定时备份和推出 / 退出时的备份都不会执行。", systemImage: "exclamationmark.triangle.fill")
+                        .appFont(.callout).foregroundStyle(Theme.warning)
+                }
+                HStack(spacing: 12) {
+                    if let last = model.backups(for: profile).first(where: { $0.isAutomatic }) {
+                        Text("上次自动备份：\(last.createdAt.shortStamp)")
+                    } else {
+                        Text("还没有自动备份过")
+                    }
+                    if profile.autosave.intervalMinutes > 0, hasPassword, let next = model.nextAutosave[profile.id] {
+                        Text("下次约 \(next.shortStamp)")
+                    }
+                }
+                .appFont(.caption).foregroundStyle(.secondary)
                 HStack {
                     if hasPassword {
                         Label("备份密码已保存在钥匙串", systemImage: "key.fill").foregroundStyle(.secondary)
@@ -265,10 +292,28 @@ struct ProfileAutomationEditor: View {
                     }
                 }
                 .appFont(.callout)
-                Text("备份保存到：\(profile.backupDirectoryURL.path)").appFont(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Text("备份保存到：\(profile.backupDirectoryURL.path)")
+                        .appFont(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Button("更改…") { chooseBackupDirectory() }.controlSize(.small)
+                    if profile.backupDirectory != nil {
+                        Button("恢复默认") { profile.backupDirectory = nil }.controlSize(.small)
+                    }
+                }
             }
         }
         .onAppear { hasPassword = KeychainStore.load(account: profile.keychainAccount) != nil }
-        .onChange(of: profile) { _, newValue in model.saveProfile(newValue) }
+        // 只回写自动化字段：这份 profile 是打开页面时的副本，期间扩容改过的容量不能被它覆盖回去。
+        .onChange(of: profile) { _, newValue in model.saveAutomation(from: newValue) }
+    }
+
+    private func chooseBackupDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = profile.backupDirectoryURL
+        panel.prompt = "选择"
+        if panel.runModal() == .OK, let url = panel.url { profile.backupDirectory = url.path }
     }
 }

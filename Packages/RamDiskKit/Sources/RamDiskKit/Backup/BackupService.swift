@@ -51,7 +51,7 @@ public actor BackupService {
             throw BackupError.failed("部分备份至少要选择一项")
         }
         let directory = try AppPaths.ensure(request.destinationDirectory)
-        let destination = directory.appendingPathComponent(Self.fileName(for: request)).path
+        let destination = Self.uniqueDestination(in: directory, fileName: Self.fileName(for: request))
         let selection = request.scope.selection.map(PathSelection.init)
 
         let payload: UInt64
@@ -119,6 +119,20 @@ public actor BackupService {
         if case .partial = request.scope { name += "-partial" }
         if request.isAutomatic { name += "-auto" }
         return name + "." + request.format.fileExtension
+    }
+
+    /// 文件名精确到秒：同一秒内的两次备份（例如手动备份撞上定时备份）会算出同一个名字。
+    /// 已存在时加序号，否则后一份会覆盖前一份，且两条记录指向同一个文件，删除其中一条会把另一条的文件也移走。
+    static func uniqueDestination(in directory: URL, fileName: String) -> String {
+        let base = (fileName as NSString).deletingPathExtension
+        let ext = (fileName as NSString).pathExtension
+        var candidate = directory.appendingPathComponent(fileName).path
+        var index = 2
+        while FileManager.default.fileExists(atPath: candidate) {
+            candidate = directory.appendingPathComponent("\(base)-\(index).\(ext)").path
+            index += 1
+        }
+        return candidate
     }
 
     // MARK: - 查看 / 校验
@@ -258,6 +272,43 @@ public actor BackupService {
         for record in autos.dropFirst(max(0, keep)) {
             try await delete(record)
         }
+    }
+
+    /// 备份文件被移动过：把记录指向新位置。只接受与记录同格式的文件。
+    @discardableResult
+    public func relocate(_ record: BackupRecord, to url: URL) async throws -> BackupRecord {
+        guard BackupFormat(rawValue: url.pathExtension.lowercased()) == record.format else {
+            throw BackupError.failed("文件格式与记录不符：这份记录是 .\(record.format.fileExtension)")
+        }
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        var updated = record
+        updated.archivePath = url.path
+        updated.archiveBytes = (attrs[.size] as? NSNumber)?.uint64Value ?? record.archiveBytes
+        try await catalog.update(updated)
+        return updated
+    }
+
+    /// 备份目录整个搬家后：在 `directory`（含子目录）里按原文件名找回所有缺失的备份文件。返回找回的条数。
+    public func relocateMissing(searching directory: URL) async throws -> Int {
+        let byName = Self.regularFilesByName(in: directory)
+        var found = 0
+        for record in await catalog.all() where !record.archiveExists {
+            guard let candidate = byName[record.archiveURL.lastPathComponent] else { continue }
+            try await relocate(record, to: candidate)
+            found += 1
+        }
+        return found
+    }
+
+    /// 同步遍历：DirectoryEnumerator 的迭代器不能在异步上下文里使用。同名文件取先遇到的那个。
+    private static func regularFilesByName(in directory: URL) -> [String: URL] {
+        var byName: [String: URL] = [:]
+        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey],
+                                                              options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return byName }
+        for case let url as URL in enumerator where (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            if byName[url.lastPathComponent] == nil { byName[url.lastPathComponent] = url }
+        }
+        return byName
     }
 
     /// 把外部的 .aea / .dmg 文件登记到备份库（例如重装系统后）。

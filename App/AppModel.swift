@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import RamDiskKit
 import ServiceManagement
+import UniformTypeIdentifiers
 
 enum SidebarItem: Hashable {
     case disk(String)          // 挂载点
@@ -80,7 +81,7 @@ final class AnalysisState {
 
 @Observable
 final class AppModel {
-    let executor = InProcessAppleScriptExecutor()
+    let executor = OsascriptExecutor()
     let manager: RamDiskManager
     let resizer: ResizeService
     let profileStore = ProfileStore()
@@ -103,8 +104,13 @@ final class AppModel {
     /// 正在被操作（扩容切换中）的挂载点：刷新时暂时查不到也保留原条目，避免详情页闪“RAM 盘已不存在”。
     @ObservationIgnored private var pinnedMounts: Set<String> = []
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
-    @ObservationIgnored private var autosaveTasks: [UUID: Task<Void, Never>] = [:]
+    /// 每块盘的定时备份任务及其间隔；间隔没变就不重建，否则每保存一次配置计时就从头来。
+    @ObservationIgnored private var autosaveTasks: [UUID: (interval: Int, task: Task<Void, Never>)] = [:]
     @ObservationIgnored private var started = false
+    /// 上次完整枚举时的挂载表指纹；没变就不必再跑 hdiutil。
+    @ObservationIgnored private var lastMountSignature: Set<String> = []
+    /// 每块盘下一次定时备份的大约时间（界面显示用）。
+    var nextAutosave: [UUID: Date] = [:]
 
     init() {
         manager = RamDiskManager(privileged: executor)
@@ -129,19 +135,27 @@ final class AppModel {
         }
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
+                let visible = self?.hasVisibleWindow ?? false
+                try? await Task.sleep(for: .seconds(visible ? 2 : 15))
                 guard let self else { return }
                 self.memory = MemoryInfo.snapshot()
-                if Date().timeIntervalSince(self.lastRefresh) > 5 {
-                    await self.refreshDisks()
-                } else {
-                    self.disks = self.disks.map { $0.refreshed() }
-                }
+                await self.refreshDisksIfNeeded(maxAge: visible ? 60 : 300)
             }
         }
     }
 
+    /// 枚举 ram:// 设备要起一个 hdiutil 进程并解析 plist。挂载表指纹没变（没有卷挂上或卸下）就只用 statfs 刷新已知盘的容量，
+    /// 超过 `maxAge` 秒仍完整枚举一次兜底。原来不管有没有窗口都每 5 秒跑一次 hdiutil。
+    func refreshDisksIfNeeded(maxAge: TimeInterval) async {
+        if MountTable.signature() != lastMountSignature || Date().timeIntervalSince(lastRefresh) > maxAge {
+            await refreshDisks()
+        } else {
+            disks = disks.map { $0.refreshed() }
+        }
+    }
+
     func refreshDisks() async {
+        let signature = MountTable.signature()
         do {
             var fresh = try await manager.list()
             // 截图只拍演示盘，不把本机其他 RAM 盘的名字和用量带进截图。
@@ -151,8 +165,23 @@ final class AppModel {
             }
             disks = fresh
             lastRefresh = Date()
+            lastMountSignature = signature
         } catch {
             // 列表失败不打扰用户，下次再试。
+        }
+    }
+
+    /// 主窗口、菜单栏面板或设置窗口是否正显示。只剩菜单栏图标时（它的窗口只有菜单栏那么高）刷新降频。
+    /// 直接看 AppKit 窗口，不靠 onAppear / onDisappear 配对：菜单栏面板关闭时 SwiftUI 不一定拆掉视图。
+    var hasVisibleWindow: Bool {
+        NSApp.windows.contains { $0.isVisible && $0.frame.height > 100 }
+    }
+
+    /// 主窗口或菜单栏面板刚出现：立即刷新一次，不等后台循环。
+    func surfaceAppeared() {
+        Task {
+            memory = MemoryInfo.snapshot()
+            await refreshDisksIfNeeded(maxAge: 10)
         }
     }
 
@@ -377,17 +406,25 @@ final class AppModel {
                 throw RamDiskError.operationFailed("“\(disk.name)”上正在进行：\(running)。请等它完成后再推出，强行推出会让它失败，盘上内容也会丢失。")
             }
             op.phase = "推出"
-            if !force, let profile = self.profile(for: disk), profile.autosave.enabled, profile.autosave.onQuit,
-               let pw = KeychainStore.load(account: profile.keychainAccount) {
-                op.phase = "推出前自动备份"
-                do {
-                    _ = try await self.performBackup(disk: disk, profile: profile, scope: .full, format: profile.autosave.format,
-                                                     password: pw, destination: profile.backupDirectoryURL, automatic: true, op: op)
-                } catch {
+            if !force, let profile = self.profile(for: disk), profile.autosave.enabled, profile.autosave.onQuit {
+                if let pw = KeychainStore.load(account: profile.keychainAccount) {
+                    op.phase = "推出前自动备份"
+                    do {
+                        _ = try await self.performBackup(disk: disk, profile: profile, scope: .full, format: profile.autosave.format,
+                                                         password: pw, destination: profile.backupDirectoryURL, automatic: true, op: op)
+                    } catch {
+                        let proceed = await self.askAboutHolders(
+                            title: "推出前的自动备份失败",
+                            message: "\(error.localizedDescription)\n\n继续推出的话，盘上的内容不会被备份，推出后就没了。", holders: [],
+                            continueLabel: "仍然推出")
+                        guard proceed else { throw CancellationError() }
+                    }
+                } else {
+                    // 用户设置了“推出时备份”，却没保存密码：原来这里直接跳过备份，用户以为有备份其实没有。
                     let proceed = await self.askAboutHolders(
-                        title: "推出前的自动备份失败",
-                        message: "\(error.localizedDescription)\n\n继续推出的话，盘上的内容不会被备份，推出后就没了。", holders: [],
-                        continueLabel: "仍然推出")
+                        title: "无法在推出前自动备份",
+                        message: "“\(disk.name)”设置了“推出 / 退出时备份”，但钥匙串里没有保存备份密码，这次不会备份。继续推出的话，盘上的内容就没了。\n\n可以先取消，到“概览 → 自动化”保存密码，或者手动备份一次。",
+                        holders: [], continueLabel: "仍然推出")
                     guard proceed else { throw CancellationError() }
                 }
             }
@@ -445,6 +482,17 @@ final class AppModel {
         }
     }
 
+    /// 只写回自动化相关的字段。“自动化”编辑器拿着的是一份副本，期间别的操作（例如扩容）可能已经改了容量，
+    /// 整份覆盖会把这些改动冲掉。
+    func saveAutomation(from edited: DiskProfile) {
+        var latest = profile(id: edited.id) ?? edited
+        latest.autoCreate = edited.autoCreate
+        latest.restoreLatestOnCreate = edited.restoreLatestOnCreate
+        latest.autosave = edited.autosave
+        latest.backupDirectory = edited.backupDirectory
+        saveProfile(latest)
+    }
+
     func deleteProfile(_ profile: DiskProfile) {
         Task {
             try? await profileStore.remove(id: profile.id)
@@ -457,8 +505,18 @@ final class AppModel {
 
     /// 把一块外部创建的 RAM 盘纳入管理（保存配置）。
     func adopt(_ disk: RamDisk) {
+        // 名字要能原样用于重建；外部工具建的卷可能含有本工具不接受的字符。
+        do {
+            try RamDiskManager.validate(name: disk.name)
+        } catch {
+            presentAlert(AppAlert(title: "无法纳入管理",
+                                  message: "\(error.localizedDescription)。按这个名字无法重建。请先在 Finder 里给卷改名，或用本工具重新创建一块盘。"))
+            return
+        }
         let custom = disk.mountPoint == "/Volumes/\(disk.name)" ? nil : disk.mountPoint
-        let profile = DiskProfile(name: disk.name, backend: disk.backend, sizeBytes: disk.capacityBytes,
+        // ram:// 盘的卷容量比设备小（APFS 容器开销），按设备大小记，重建时才能得到同样大的盘。
+        let size = disk.backend.isRamDevice && disk.deviceBytes > 0 ? disk.deviceBytes : disk.capacityBytes
+        let profile = DiskProfile(name: disk.name, backend: disk.backend, sizeBytes: size,
                                   customMountPoint: custom, options: disk.options)
         saveProfile(profile)
     }
@@ -481,7 +539,7 @@ final class AppModel {
             let options = ResizeOptions(confirmHolders: { holders in
                 await self.askAboutHolders(
                     title: "有程序正在使用“\(disk.name)”",
-                    message: "切换到新盘的瞬间，这些程序打开的文件句柄会失效（文件内容已完整复制到新盘）。建议先关闭它们。",
+                    message: "切换到新盘的瞬间，这些程序打开的文件句柄会失效（文件内容已完整复制到新盘）。它们在切换前最后一刻写入的内容不会带到新盘；校验发现这种改写会回滚。建议先关闭它们。",
                     holders: holders, continueLabel: "继续切换")
             })
             let result = try await self.resizer.resize(disk, to: newSize, options: options) { p in
@@ -489,6 +547,8 @@ final class AppModel {
                     op.phase = p.phase.displayName
                     op.detail = p.message
                     op.fraction = p.sync.map(\.fraction)
+                    op.bytesDone = p.sync?.bytesDone ?? 0
+                    op.bytesTotal = p.sync?.bytesTotal ?? 0
                 }
             }
             self.upsertDisk(result.disk)
@@ -500,6 +560,53 @@ final class AppModel {
             self.analyses[disk.mountPoint] = nil
             op.phase = "完成"
             op.detail = "切换耗时 \(String(format: "%.2f", result.switchDuration)) 秒"
+        }
+    }
+
+    // MARK: - 挂载选项
+
+    /// 修改运行中盘的 nobrowse / noexec / Spotlight；管理中的盘同步更新配置，重建时沿用。
+    /// tmpfs 的 nobrowse / noexec 不在线修改（见 `RamDiskManager.updateMountOptions`）：只写进配置，推出后重建时生效。
+    @discardableResult
+    func updateMountOptions(_ disk: RamDisk, hidden: Bool, noExec: Bool, spotlightDisabled: Bool?) -> Operation {
+        run("修改“\(disk.name)”的挂载选项", mountPoint: disk.mountPoint) { op in
+            if self.isBusy(disk.mountPoint, except: op) {
+                throw RamDiskError.operationFailed("“\(disk.name)”上有操作正在进行，请等它完成。")
+            }
+            let flagsChanged = hidden != disk.hidden || noExec != disk.noExec
+            let flagsLive = flagsChanged && disk.backend.isRamDevice
+            if flagsChanged, !flagsLive, self.profile(for: disk) == nil {
+                throw RamDiskError.operationFailed("tmpfs 的 nobrowse / noexec 不能在运行中修改，需要推出后按新选项重建。这块盘不是本工具管理的，请先“纳入管理”，重建时才能带上新选项。")
+            }
+            if flagsLive || spotlightDisabled != nil {
+                // 运行中的盘只应用能在线改的部分：ram:// 盘的标志、两种后端的 Spotlight。
+                let live = MountOptions(hidden: flagsLive ? hidden : disk.hidden, noExec: flagsLive ? noExec : disk.noExec,
+                                        disableSpotlight: spotlightDisabled ?? false)
+                op.phase = flagsLive ? "重新挂载" : "更新 Spotlight 设置"
+                let updated: RamDisk
+                do {
+                    updated = try await self.manager.updateMountOptions(disk, options: live, spotlightDisabled: spotlightDisabled)
+                } catch RamDiskError.busy(let holders) {
+                    let proceed = await self.askAboutHolders(
+                        title: "“\(disk.name)”正在被使用",
+                        message: "修改 ram:// 盘的挂载选项要先卸载再重新挂载，这些程序打开的文件句柄会失效（盘上内容不受影响）。建议先关闭它们。",
+                        holders: holders, continueLabel: "继续")
+                    guard proceed else { throw CancellationError() }
+                    updated = try await self.manager.updateMountOptions(disk, options: live, spotlightDisabled: spotlightDisabled, force: true)
+                }
+                self.upsertDisk(updated)
+            }
+            if var profile = self.profile(for: disk) {
+                profile.options.hidden = hidden
+                profile.options.noExec = noExec
+                if let spotlightDisabled { profile.options.disableSpotlight = spotlightDisabled }
+                try await self.profileStore.upsert(profile)
+                self.profiles = await self.profileStore.all()
+                if flagsChanged, !flagsLive {
+                    self.presentAlert(AppAlert(title: "已保存到配置，推出后重建时生效",
+                                               message: "tmpfs 的 nobrowse / noexec 不能在运行中修改。新的选项已保存到“\(disk.name)”的配置，这块盘推出后按配置重建时会带上。"))
+                }
+            }
         }
     }
 
@@ -607,6 +714,46 @@ final class AppModel {
         }
     }
 
+    /// 备份文件被移走了：让用户指出它现在的位置。
+    func relocateBackup(_ record: BackupRecord) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = record.format == .aea ? [UTType(filenameExtension: "aea") ?? .data] : [.diskImage]
+        panel.message = "找到 \(record.archiveURL.lastPathComponent) 现在的位置"
+        panel.directoryURL = record.archiveURL.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                _ = try await backupService.relocate(record, to: url)
+                await reloadBackups()
+            } catch {
+                presentAlert(AppAlert(title: "重新定位失败", message: error.localizedDescription))
+            }
+        }
+    }
+
+    /// 备份目录整个搬过家：在新目录里按文件名找回所有缺失的备份。
+    func relocateMissingBackups() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = "选择备份文件现在所在的文件夹（会连同子文件夹一起找）"
+        panel.prompt = "在这里找"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                let found = try await backupService.relocateMissing(searching: url)
+                await reloadBackups()
+                let missing = backups.filter { !$0.archiveExists }.count
+                presentAlert(AppAlert(title: "找回了 \(found) 份备份的文件",
+                                      message: missing == 0 ? "所有备份文件都已找到。" : "仍有 \(missing) 份找不到文件，可以逐个“重新定位”。"))
+            } catch {
+                presentAlert(AppAlert(title: "查找失败", message: error.localizedDescription))
+            }
+        }
+    }
+
     func importBackup(_ url: URL) {
         Task {
             do {
@@ -676,18 +823,27 @@ final class AppModel {
 
     // MARK: - 自动备份
 
+    /// 按配置启停定时备份。只动新开启、间隔改变或已关闭的盘：原来每保存一次任何配置都把全部计时器清零重来。
     func rescheduleAutosave() {
-        for task in autosaveTasks.values { task.cancel() }
-        autosaveTasks.removeAll()
+        var wanted: [UUID: Int] = [:]
         for profile in profiles where profile.autosave.enabled && profile.autosave.intervalMinutes > 0 {
-            let id = profile.id
-            autosaveTasks[id] = Task { [weak self] in
+            wanted[profile.id] = profile.autosave.intervalMinutes
+        }
+        for (id, entry) in autosaveTasks where wanted[id] != entry.interval {
+            entry.task.cancel()
+            autosaveTasks[id] = nil
+            nextAutosave[id] = nil
+        }
+        for (id, minutes) in wanted where autosaveTasks[id] == nil {
+            let task = Task { [weak self] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(Double(profile.autosave.intervalMinutes) * 60))
+                    self?.nextAutosave[id] = Date().addingTimeInterval(Double(minutes) * 60)
+                    try? await Task.sleep(for: .seconds(Double(minutes) * 60))
                     guard !Task.isCancelled, let self else { return }
                     await self.autosave(profileID: id)
                 }
             }
+            autosaveTasks[id] = (minutes, task)
         }
     }
 
@@ -725,14 +881,42 @@ final class AppModel {
 
     // MARK: - 登录启动
 
+    /// 登录项状态。SMAppService 的状态不是可观察属性，改动后要手动刷新。
+    var loginItemStatus: SMAppService.Status = SMAppService.mainApp.status
+
+    func refreshLoginItemStatus() { loginItemStatus = SMAppService.mainApp.status }
+
     var launchAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
+        get { loginItemStatus == .enabled }
         set {
             do {
                 if newValue { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
             } catch {
                 presentAlert(AppAlert(title: "设置登录启动失败", message: error.localizedDescription))
             }
+            refreshLoginItemStatus()
+            if newValue, loginItemStatus == .requiresApproval {
+                presentAlert(AppAlert(title: "需要在系统设置里批准",
+                                      message: "系统已记录登录项，但要在“系统设置 → 通用 → 登录项与扩展”里允许 RamDiskMgt 后才会生效。"))
+            }
         }
     }
+
+    /// 登录项不生效的常见原因：ad-hoc 签名、不在“应用程序”文件夹的应用，系统可能拒绝注册，或在重新构建后找不到它。
+    var launchAtLoginNote: String? {
+        switch loginItemStatus {
+        case .requiresApproval:
+            return "等待在“系统设置 → 通用 → 登录项与扩展”里批准。"
+        case .notFound:
+            return "系统找不到这个登录项，通常是应用被移动或重新构建过。关掉再打开一次可以重新注册。"
+        default:
+            let path = Bundle.main.bundlePath
+            if !path.hasPrefix("/Applications/"), !path.hasPrefix(NSHomeDirectory() + "/Applications/") {
+                return "应用不在“应用程序”文件夹里（\(path)）。登录项记录的是当前位置，移动或重新构建后会失效；长期使用建议放到“应用程序”里并用固定证书签名（见 scripts/build.sh）。"
+            }
+            return nil
+        }
+    }
+
+    func openLoginItemsSettings() { SMAppService.openSystemSettingsLoginItems() }
 }

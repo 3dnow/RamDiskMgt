@@ -18,6 +18,8 @@ brew install xcodegen   # 如未安装
 - `build/RamDiskMgt.app`：ad-hoc 签名，本机直接运行
 - `build/rdmctl`：命令行工具
 
+长期使用建议用固定证书签名并放进“应用程序”文件夹：`RDM_SIGN_IDENTITY="Apple Development: …" ./scripts/build.sh`。ad-hoc 签名每次构建都不同，钥匙串会在每次重新构建后再次询问是否允许读取备份密码，登录项也会失效。
+
 `RamDiskMgt.xcodeproj` 由 xcodegen 根据 `project.yml` 生成，不在仓库里。想用 Xcode 打开，先运行一次 `xcodegen generate`。
 
 ## 功能
@@ -25,7 +27,7 @@ brew install xcodegen   # 如未安装
 | 功能 | 说明 |
 |---|---|
 | 创建 | 四种类型：APFS、APFS（区分大小写）、HFS+、tmpfs。可选挂载位置，可设 nobrowse（Finder 隐藏）、noexec、关闭 Spotlight |
-| 管理 | 列出本机所有 RAM 盘（包括其他工具创建的，可“纳入管理”）；显示容量和实际占用内存；系统内存压力；占用进程检查；推出（被占用时列出进程，可强制推出） |
+| 管理 | 列出本机所有 RAM 盘（包括其他工具创建的，可“纳入管理”）；显示容量和实际占用内存；系统内存压力；占用进程检查；推出（被占用时列出进程，可强制推出）；运行中修改 nobrowse / noexec / Spotlight（tmpfs 的 nobrowse / noexec 只保存到配置，重建时生效） |
 | 扩容 / 在线扩容 / 缩容 | 热迁移：原盘照常使用时先全量同步，再增量同步，然后切换到新盘，核对一致后才释放旧盘，失败自动回滚。APFS 切换约 0.1 秒 |
 | 加密备份 | 两种格式：AEA（AES-256 + LZFSE 压缩）和加密 DMG（Finder 可直接挂载）。整盘或勾选部分文件；密码可存钥匙串；支持定时自动备份、推出/退出时备份、只保留最近 N 份 |
 | 还原 / 重建 | 还原整份或部分文件，可选“合并”或“替换”；推出后的盘以“已保存（未运行）”配置保留，一键按原配置重建并还原；可设应用启动时自动重建 |
@@ -64,10 +66,10 @@ build/rdmctl analyze /Volumes/Cache --top 20
 ```
 
 ```bash
-build/rdmctl clean /Volumes/Cache --min-size 200M --dry-run
+build/rdmctl clean /Volumes/Cache --min-size 200M
 ```
 
-`rdmctl` 不带参数会显示全部命令。密码只从环境变量 `RDM_PASSWORD` 或交互输入读取，不走命令行参数。
+`rdmctl` 不带参数会显示全部命令。密码只从环境变量 `RDM_PASSWORD` 或交互输入读取，不走命令行参数。`clean` 默认只列出候选文件，加 `--yes` 才真正删除。
 
 ## 数据位置
 
@@ -79,6 +81,8 @@ build/rdmctl clean /Volumes/Cache --min-size 200M --dry-run
 | 备份密码 | 登录钥匙串，服务名 `RamDiskMgt`：每块盘一条（`profile:<id>`），勾选保存的每份备份再各存一条（`backup:<id>`），删除备份时一并删除 |
 
 设置环境变量 `RDM_SUPPORT_DIR` 可以把上面这些换到别的目录，测试时就是这么做的。
+
+tmpfs 相关的管理员命令通过 `osascript` 子进程执行，界面不会被卡住。
 
 ## 开发与测试
 
@@ -102,8 +106,9 @@ RDM_SUPPORT_DIR=/tmp/rdm-shots build/RamDiskMgt.app/Contents/MacOS/RamDiskMgt --
 - 第二条：集成测试，会创建并推出名为 `RDMTest*` 的真实 ram:// 盘。
 - 第三条：GUI 层端到端自检；把 `apfs` 换成 `tmpfs` 会弹管理员密码框。
 - 第四条：把主要界面渲染成 PNG。
+- 第三、四条用到的诊断入口只在 Debug 构建里，Release 产物默认不带；要在 Release 上跑就用 `RDM_DIAGNOSTICS=1 ./scripts/build.sh` 构建。
 
-设计与实测结论见 [docs/设计文档.md](docs/设计文档.md)，测试记录见 [docs/测试报告.md](docs/测试报告.md)。
+设计与实测结论见 [docs/设计文档.md](docs/设计文档.md)，测试记录见 [docs/测试报告.md](docs/测试报告.md)，代码审查结论见 [docs/代码审查-2026-11.md](docs/代码审查-2026-11.md)，审查改动的本地验证步骤见 [docs/本地测试指南.md](docs/本地测试指南.md)。
 
 ## 目录结构
 

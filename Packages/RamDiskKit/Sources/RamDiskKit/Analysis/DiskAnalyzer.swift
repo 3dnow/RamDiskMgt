@@ -281,13 +281,19 @@ public enum DiskAnalyzer {
         }.value
     }
 
+    /// 读不完整时返回 nil：半截内容的哈希会让两个读失败的文件被当成“内容相同”，进而被当作重复文件删掉。
     static func hash(path: String, limit: Int?) -> Data? {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         var hasher = SHA256()
         var remaining = limit ?? Int.max
         while remaining > 0 {
-            let chunk = (try? handle.read(upToCount: min(1 << 20, remaining))) ?? nil
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: min(1 << 20, remaining))
+            } catch {
+                return nil
+            }
             guard let chunk, !chunk.isEmpty else { break }
             hasher.update(data: chunk)
             remaining -= chunk.count

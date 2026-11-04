@@ -53,6 +53,11 @@ public enum MountTable {
         return buffer.prefix(Int(filled)).map(MountEntry.init)
     }
 
+    /// 挂载表的快速指纹（一次 getfsstat 系统调用）。没变化就说明没有新挂载或卸载的卷，不必再跑 hdiutil 枚举设备。
+    public static func signature() -> Set<String> {
+        Set(current().map { "\($0.fsType)|\($0.source)|\($0.mountPoint)" })
+    }
+
     /// 某个路径所在文件系统的实时统计。
     public static func entry(at path: String) -> MountEntry? {
         var s = statfs()

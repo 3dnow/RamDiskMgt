@@ -18,7 +18,8 @@ let usage = """
   restore <备份ID> --to <挂载点> [--paths a,b] [--replace]
   analyze <挂载点> [--top 20]
   dupes <挂载点> [--min 1M]
-  clean <挂载点> [--min-size 100M] [--older-than-hours 24] [--pattern '*.log'] [--dry-run]
+  clean <挂载点> [--min-size 100M] [--older-than-hours 24] [--pattern '*.log'] [--yes]
+                                         列出符合规则的文件；加 --yes 才真正删除（RAM 盘没有废纸篓，不可恢复）
 """
 
 struct Args {
@@ -26,13 +27,21 @@ struct Args {
     var options: [String: String] = [:]
     var flags: Set<String> = []
 
+    /// 不带值的开关。否则 `resize --yes /Volumes/X --size 2G` 里的挂载点会被当成 --yes 的值。
+    static let booleanFlags: Set<String> = ["force", "yes", "hidden", "noexec", "replace", "dry-run"]
+
     init(_ raw: [String]) {
         var i = 0
         while i < raw.count {
             let a = raw[i]
             if a.hasPrefix("--") {
                 let key = String(a.dropFirst(2))
-                if i + 1 < raw.count, !raw[i + 1].hasPrefix("--") {
+                if let eq = key.firstIndex(of: "=") {
+                    options[String(key[..<eq])] = String(key[key.index(after: eq)...])
+                    i += 1
+                    continue
+                }
+                if !Self.booleanFlags.contains(key), i + 1 < raw.count, !raw[i + 1].hasPrefix("--") {
                     options[key] = raw[i + 1]
                     i += 2
                     continue
@@ -226,10 +235,15 @@ func run() async throws {
         let total = candidates.reduce(UInt64(0)) { $0 + $1.size }
         for c in candidates { print("  \(ByteSize.format(c.size))\t\(c.path)\t\(c.reasons.joined(separator: "，"))") }
         print("共 \(candidates.count) 个候选，\(ByteSize.format(total))")
-        if !args.has("dry-run"), !candidates.isEmpty {
-            let report = await CleanupService.delete(relativePaths: candidates.map(\.path), root: disk.mountPoint)
-            print("已删除 \(report.deletedCount) 个，释放约 \(ByteSize.format(report.freedBytes))（卷可用空间实际增加 \(ByteSize.format(report.measuredFreedBytes))）")
-            report.failures.forEach { print("  失败：\($0)") }
+        // 默认只列出。删除是永久的，必须显式加 --yes（原来不加 --dry-run 就直接删，太危险）。
+        if !candidates.isEmpty {
+            if args.has("yes") {
+                let report = await CleanupService.delete(relativePaths: candidates.map(\.path), root: disk.mountPoint)
+                print("已删除 \(report.deletedCount) 个，释放约 \(ByteSize.format(report.freedBytes))（卷可用空间实际增加 \(ByteSize.format(report.measuredFreedBytes))）")
+                report.failures.forEach { print("  失败：\($0)") }
+            } else {
+                print("以上只是列出，没有删除。确认无误后加 --yes 执行删除（永久删除，不进废纸篓）。")
+            }
         }
 
     default:

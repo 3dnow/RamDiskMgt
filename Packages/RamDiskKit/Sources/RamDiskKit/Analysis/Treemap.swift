@@ -23,6 +23,8 @@ public enum Treemap {
         var index = 0
 
         while index < areas.count {
+            // 浮点误差可能让剩余区域先于条目耗尽；继续摆放会除以 0 得到 NaN 矩形。
+            guard remaining.width > 0, remaining.height > 0 else { break }
             let item = areas[index]
             let side = Double(min(remaining.width, remaining.height))
             if row.isEmpty || worst(row + [item], side: side) <= worst(row, side: side) {
@@ -33,7 +35,7 @@ public enum Treemap {
                 row = []
             }
         }
-        if !row.isEmpty { _ = place(row, in: remaining, into: &cells) }
+        if !row.isEmpty, remaining.width > 0, remaining.height > 0 { _ = place(row, in: remaining, into: &cells) }
         return cells
     }
 
